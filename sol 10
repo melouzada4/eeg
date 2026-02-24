@@ -1,0 +1,753 @@
+# ============================================================
+# EEG ANALYSIS (HÍBRIDO "ESTILO ANTIGO" + METODOLOGIA ROBUSTA)
+# - PSD por intervalo -> média do PSD por condição/canal -> FOOOF 1x
+# - Gráficos zoomados por banda + caixa de estatísticas
+# - Opção A: ID na planilha = nome do arquivo .set (sem extensão)
+# - Log JSON + TXT resumo por canal/condição
+# ============================================================
+
+import os
+import json
+import platform
+from datetime import datetime
+from pathlib import Path
+import warnings
+import gc  # garbage collector — liberar memória entre canais
+
+import numpy as np
+import pandas as pd
+import mne
+import matplotlib
+matplotlib.use("Agg")          # backend sem janela — evita travamento em loops longos
+import matplotlib.pyplot as plt
+from scipy.signal import welch
+from fooof import FOOOF
+
+# =========================
+# SILENCIAR AVISOS
+# =========================
+mne.set_log_level("WARNING")
+warnings.filterwarnings("ignore", category=DeprecationWarning, module=r"^fooof(\.|$)")
+warnings.filterwarnings("ignore", category=RuntimeWarning)
+warnings.filterwarnings("ignore", category=DeprecationWarning, message=r".*fooof.*deprecated.*")
+warnings.filterwarnings("ignore", category=UserWarning, message=r".*tight_layout.*")
+
+# =========================
+# CONFIGURAÇÕES
+# =========================
+DURACAO_INTERVALO = 6  # segundos
+NUM_INTERVALOS_OA = 10
+NUM_INTERVALOS_OF = 10
+
+FMIN_GLOBAL = 1.0
+FMAX_GLOBAL = 40.0
+
+BANDAS = {
+    "delta": (1.0,  4.0),
+    "theta": (4.0,  8.0),
+    "alpha": (8.0, 13.0),
+    "beta":  (13.0, 30.0),
+}
+
+WELCH_WIN_SEC      = 2.0
+WELCH_OVERLAP_FRAC = 0.5
+NFFT_MIN           = 2048
+
+FOOOF_CONFIG = {
+    "peak_width_limits": [1, 12],
+    "max_n_peaks":        3,
+    "min_peak_height":    0.01,
+    "peak_threshold":     2.0,
+    "aperiodic_mode":    "fixed",
+    "verbose":            False,
+}
+
+FOOOF_R2_MIN  = 0.70
+FOOOF_ERR_MAX = 0.30
+
+# =========================
+# CAMINHOS
+# =========================
+PASTA_SET      = r'C:/Users/meloliveira/Documents/eeg'
+PLANILHA_PATH  = r'C:/Users/meloliveira/Documents/intervalos_pacientes.xlsx'
+SUBPASTA_SAIDA = "sol10"
+PASTA_SAIDA    = os.path.join(PASTA_SET, SUBPASTA_SAIDA)
+os.makedirs(PASTA_SAIDA, exist_ok=True)
+
+
+# =========================
+# PLANILHA
+# =========================
+def carregar_intervalos_planilha(caminho_planilha):
+    df     = pd.read_excel(caminho_planilha)
+    col_id = df.columns[0]
+    intervalos = {}
+
+    for _, row in df.iterrows():
+        id_str = str(row[col_id]).strip()
+        if not id_str or id_str.lower() == "nan":
+            continue
+
+        oa = [int(row.iloc[i]) for i in range(1, 11)
+              if i < len(row) and not pd.isna(row.iloc[i])]
+        of = [int(row.iloc[i]) for i in range(11, 21)
+              if i < len(row) and not pd.isna(row.iloc[i])]
+
+        if len(oa) >= 10 and len(of) >= 10:
+            intervalos[id_str] = {"OA": oa[:10], "OF": of[:10]}
+
+    return intervalos
+
+
+# =========================
+# UTIL
+# =========================
+def salvar_json(path, payload):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, ensure_ascii=False)
+
+
+def extrair_segmento(sig_1d, sfreq, inicio_s, dur_s):
+    ini = int(round(inicio_s * sfreq))
+    fim = int(round((inicio_s + dur_s) * sfreq))
+    ini = max(0, ini)
+    fim = min(sig_1d.shape[0], fim)
+    if fim <= ini:
+        return None
+    return sig_1d[ini:fim]
+
+
+def welch_psd(sig_1d, sfreq):
+    n = sig_1d.shape[0]
+    if n < int(sfreq):
+        return None, None
+
+    nperseg  = min(max(int(round(WELCH_WIN_SEC * sfreq)), int(sfreq)), n)
+    noverlap = min(int(round(WELCH_OVERLAP_FRAC * nperseg)), nperseg - 1)
+    nfft     = max(int(4 * sfreq), NFFT_MIN)
+
+    freqs, pxx = welch(sig_1d, fs=sfreq,
+                       nperseg=nperseg, noverlap=noverlap, nfft=nfft)
+    return freqs, pxx
+
+
+def idx_range(freqs, fmin, fmax):
+    return (freqs >= fmin) & (freqs <= fmax)
+
+
+# =========================
+# FOOOF NO PSD MÉDIO
+# =========================
+def ajustar_fooof_no_psd_medio(freqs, psd_med, fmin=FMIN_GLOBAL, fmax=FMAX_GLOBAL):
+    idx = idx_range(freqs, fmin, fmax)
+    if idx.sum() < 20:
+        return None
+
+    f = freqs[idx]
+    p = psd_med[idx]
+
+    if np.any(~np.isfinite(p)) or np.any(p <= 0):
+        return None
+
+    fm = FOOOF(**FOOOF_CONFIG)
+    fm.fit(f, p)
+
+    r2  = float(getattr(fm, "r_squared_", 0.0) or 0.0)
+    err = float(getattr(fm, "error_",     np.inf) or np.inf)
+    ok  = (r2 >= FOOOF_R2_MIN) and (err <= FOOOF_ERR_MAX)
+
+    orig_micro     = p                            * 1e12
+    ap_micro       = (10 ** fm._ap_fit)           * 1e12
+    full_micro     = (10 ** fm.fooofed_spectrum_) * 1e12
+    periodic_micro = full_micro - ap_micro
+
+    ap_params = list(fm.aperiodic_params_) if hasattr(fm, "aperiodic_params_") else []
+
+    return {
+        "ok":             ok,
+        "fm":             fm,
+        "freqs":          f,
+        "orig_micro":     orig_micro,
+        "ap_micro":       ap_micro,
+        "full_micro":     full_micro,
+        "periodic_micro": periodic_micro,
+        "r2":             r2,
+        "err":            err,
+        "ap_params":      ap_params,
+    }
+
+
+def metricas_por_banda(freqs, orig_micro, ap_micro, periodic_micro, fmin, fmax):
+    idx = idx_range(freqs, fmin, fmax)
+    if idx.sum() < 5:
+        return None
+
+    f = freqs[idx]
+    o = orig_micro[idx]
+    a = ap_micro[idx]
+    p = periodic_micro[idx]
+
+    return {
+        "psd_media_original":  float(np.mean(o)),
+        "area_original":       float(np.trapezoid(o, f)),
+        "psd_media_aperiodic": float(np.mean(a)),
+        "area_aperiodic":      float(np.trapezoid(a, f)),
+        "psd_media_periodic":  float(np.mean(p)),
+        "area_periodic":       float(np.trapezoid(p, f)),
+    }
+
+
+def resumo_picos_faixa(fm, fmin, fmax):
+    peaks = getattr(fm, "peak_params_", None)
+    if peaks is None or len(peaks) == 0:
+        return {"n": 0, "freq_media": None, "amp_media": None, "bw_media": None}
+
+    peaks = np.array(peaks)
+    freqs = peaks[:, 0]
+    amps  = peaks[:, 1]
+    bws   = peaks[:, 2]
+    m     = (freqs >= fmin) & (freqs <= fmax)
+
+    if m.sum() == 0:
+        return {"n": 0, "freq_media": None, "amp_media": None, "bw_media": None}
+
+    return {
+        "n":          int(m.sum()),
+        "freq_media": float(np.mean(freqs[m])),
+        "amp_media":  float(np.mean(amps[m])),
+        "bw_media":   float(np.mean(bws[m])),
+    }
+
+
+# =========================
+# PLOT
+# CORREÇÕES:
+#   1. constrained_layout=True no lugar de plt.tight_layout()
+#      (tight_layout é incompatível com GridSpec + wspace → gerava UserWarning)
+#   2. plt.close(fig) em bloco try/finally
+#      (garante que a figura é fechada mesmo se ocorrer erro no meio,
+#       evitando acumulação de figuras abertas que trava o loop em canais longe do Fp1)
+#   3. matplotlib.use("Agg") no topo
+#      (backend sem janela gráfica — obrigatório para loops longos sem display)
+# =========================
+def plot_zoom_banda_com_stats(resultado_fooof, banda_nome, canal, cond,
+                              paciente_id, pasta_saida, fmin_b, fmax_b,
+                              n_validos, n_total=10):
+    f    = resultado_fooof["freqs"]
+    orig = resultado_fooof["orig_micro"]
+    ap   = resultado_fooof["ap_micro"]
+    full = resultado_fooof["full_micro"]
+    per  = resultado_fooof["periodic_micro"]
+    fm   = resultado_fooof["fm"]
+    r2   = resultado_fooof["r2"]
+    err  = resultado_fooof["err"]
+    ap_params = resultado_fooof.get("ap_params", [])
+
+    idx = idx_range(f, fmin_b, fmax_b)
+    if idx.sum() < 5:
+        return
+
+    fz    = f[idx]
+    origz = orig[idx]
+    apz   = ap[idx]
+    fullz = full[idx]
+    perz  = per[idx]
+
+    met   = metricas_por_banda(f, orig, ap, per, fmin_b, fmax_b) or {}
+    peaks = resumo_picos_faixa(fm, fmin_b, fmax_b)
+
+    pk_freq_vis = float(fz[int(np.argmax(perz))]) if len(perz) > 0 else None
+    pk_val_vis  = float(np.max(perz))              if len(perz) > 0 else None
+
+    titulo_cond = "Olhos Abertos" if cond == "OA" else "Olhos Fechados"
+    nan = float("nan")
+
+    # constrained_layout=True — compatível com GridSpec, sem warnings
+    fig = plt.figure(figsize=(16, 7), constrained_layout=True)
+    fig.patch.set_facecolor("white")
+
+    try:
+        gs       = fig.add_gridspec(1, 2, width_ratios=[7, 3])
+        ax_plot  = fig.add_subplot(gs[0])
+        ax_stats = fig.add_subplot(gs[1])
+        ax_stats.axis("off")
+
+        # ---- curvas ----
+        ax_plot.plot(fz, origz, linewidth=1.3, color="black",
+                     label="Original")
+        ax_plot.plot(fz, fullz, linewidth=2.0, color="#e74c3c",
+                     label="FOOOF full fit")
+        ax_plot.plot(fz, apz,   linewidth=2.0, color="#3498db",
+                     linestyle="--", label="Aperiódico")
+        ax_plot.fill_between(fz, apz, fullz, color="#2ecc71",
+                             alpha=0.25, label="Periódico")
+
+        ax_plot.set_title(
+            f"Banda {banda_nome.upper()} — Canal {canal} — {titulo_cond} — {paciente_id} "
+            f"({n_validos}/{n_total})",
+            fontsize=12, fontweight="bold", pad=10
+        )
+        ax_plot.set_xlabel("Frequência (Hz)", fontsize=11)
+        ax_plot.set_ylabel("Densidade Espectral de Potência (µV²/Hz)", fontsize=11)
+        ax_plot.grid(True, linestyle="--", alpha=0.3)
+        ax_plot.legend(loc="lower right", fontsize=9,
+                       framealpha=0.9, fancybox=True, edgecolor="black")
+
+        # ---- painel de stats ----
+        stats_lines = [
+            "Estatísticas",
+            f"{banda_nome.upper()} ({fmin_b:.1f}–{fmax_b:.1f} Hz)",
+            "",
+            "─" * 28,
+        ]
+
+        if len(ap_params) >= 2:
+            stats_lines += [
+                "APERIÓDICO (1/f):",
+                f"  Offset  : {ap_params[0]:.4f}",
+                f"  Expoente: {ap_params[1]:.4f}  <- E/I",
+                "",
+                "─" * 28,
+            ]
+
+        stats_lines += [
+            "ORIGINAL:",
+            f"  PSD media: {met.get('psd_media_original', nan):.4f} uV2/Hz",
+            f"  Area:      {met.get('area_original',       nan):.4f} uV2",
+            "",
+            "APERIODICO:",
+            f"  PSD media: {met.get('psd_media_aperiodic', nan):.4f} uV2/Hz",
+            f"  Area:      {met.get('area_aperiodic',       nan):.4f} uV2",
+            "",
+            "PERIODICO:",
+            f"  PSD media: {met.get('psd_media_periodic', nan):.4f} uV2/Hz",
+            f"  Area:      {met.get('area_periodic',       nan):.4f} uV2",
+            "",
+            "─" * 28,
+            "FOOOF:",
+            f"  R2:      {r2:.4f}",
+            f"  Erro:    {err:.4f}",
+            f"  Gate OK: {resultado_fooof.get('ok', False)}",
+            f"  Picos:   {peaks['n']}",
+        ]
+
+        if peaks["n"] > 0 and peaks["freq_media"] is not None:
+            stats_lines.append(f"  Freq media: {peaks['freq_media']:.2f} Hz")
+
+        if pk_freq_vis is not None:
+            stats_lines += [
+                "",
+                "─" * 28,
+                "Pico periodico (visual):",
+                f"  Freq: {pk_freq_vis:.2f} Hz",
+                f"  PSD:  {pk_val_vis:.4f} uV2/Hz",
+            ]
+
+        ax_stats.text(
+            0.05, 0.97, "\n".join(stats_lines),
+            transform=ax_stats.transAxes,
+            ha="left", va="top", fontsize=9,
+            fontfamily="monospace",
+            bbox=dict(boxstyle="round,pad=0.6", facecolor="white",
+                      edgecolor="black", alpha=0.95, linewidth=1),
+        )
+
+        nome_png = f"{paciente_id}_{canal}_{banda_nome}_{cond}_FOOOF_MEDIA.png"
+        fig.savefig(os.path.join(pasta_saida, nome_png), dpi=150,
+                    bbox_inches="tight", facecolor="white")
+
+    finally:
+        plt.close(fig)   # fecha sempre, mesmo se der erro — evita travamento
+
+
+# =========================
+# TXT COMPLETO
+# =========================
+def salvar_txt_resumo(pasta_saida, paciente_id, canal, cond, n_validos,
+                      resultados_por_banda, fooof_info,
+                      inicios_intervalos=None, psds_brutos=None):
+    caminho   = os.path.join(pasta_saida, f"{paciente_id}_{canal}_{cond}_RESUMO.txt")
+    fm        = fooof_info.get("fm")
+    ap_params = fooof_info.get("ap_params", [])
+
+    with open(caminho, "w", encoding="utf-8") as f:
+
+        f.write("=" * 75 + "\n")
+        f.write("ANALISE EEG/FOOOF COMPLETA\n")
+        f.write("Referencia: Donoghue et al. (2020) Nature Neuroscience\n")
+        f.write("=" * 75 + "\n")
+        f.write(f"Paciente          : {paciente_id}\n")
+        f.write(f"Canal             : {canal}\n")
+        f.write(f"Condicao          : {'Olhos Abertos' if cond == 'OA' else 'Olhos Fechados'}\n")
+        f.write(f"Segmentos validos : {n_validos}/10  ({DURACAO_INTERVALO}s cada)\n")
+        f.write(f"Gerado em         : {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}\n")
+        f.write("=" * 75 + "\n\n")
+
+        f.write("METODOLOGIA:\n")
+        f.write(f"  1. PSD estimado pelo metodo de Welch (janela={WELCH_WIN_SEC}s, "
+                f"sobreposicao={int(WELCH_OVERLAP_FRAC*100)}%) em cada segmento de {DURACAO_INTERVALO}s.\n")
+        f.write(f"  2. Media dos {n_validos} PSDs individuais -> espectro medio estavel.\n")
+        f.write(f"  3. FOOOF ajustado UMA VEZ no espectro medio ({FMIN_GLOBAL}-{FMAX_GLOBAL} Hz).\n")
+        f.write(f"  4. Decomposicao: Aperodico (1/f) + Periodico (oscilacoes reais).\n")
+        f.write(f"  5. PSD do pico = elevacao acima do aperiodico em uV2/Hz.\n\n")
+
+        # Seção 1
+        f.write("-" * 75 + "\n")
+        f.write("1. QUALIDADE DO AJUSTE FOOOF + PARAMETROS APERIODICOS\n")
+        f.write("-" * 75 + "\n")
+        f.write(f"  R2            : {fooof_info['r2']:.4f}  (minimo aceitavel: {FOOOF_R2_MIN})\n")
+        f.write(f"  Erro medio    : {fooof_info['err']:.4f}  (maximo aceitavel: {FOOOF_ERR_MAX})\n")
+        f.write(f"  Ajuste OK     : {fooof_info['ok']}\n\n")
+        f.write("  PARAMETROS APERIODICOS:\n")
+        f.write("  O expoente aperiodico reflete o balanco excitacao/inicao (E/I) cortical.\n")
+        f.write("  Expoentes maiores -> maior dominancia inibitoria. (Donoghue et al. 2020)\n\n")
+
+        if fm is not None and hasattr(fm, "aperiodic_params_"):
+            ap = fm.aperiodic_params_
+            f.write(f"  Offset         : {ap[0]:.4f}  (intercepto do espectro em log)\n")
+            if len(ap) == 2:
+                f.write(f"  Expoente (1/f) : {ap[1]:.4f}  <- METRICA PRINCIPAL E/I\n")
+            elif len(ap) == 3:
+                f.write(f"  Knee           : {ap[1]:.4f}\n")
+                f.write(f"  Expoente (1/f) : {ap[2]:.4f}  <- METRICA PRINCIPAL E/I\n")
+        else:
+            f.write("  Parametros aperiodicos nao disponiveis.\n")
+        f.write("\n")
+
+        # Seção 2
+        f.write("-" * 75 + "\n")
+        f.write("2. METRICAS POR BANDA \n")
+        f.write("   Calculadas sobre o espectro medio decomposto pelo FOOOF.\n")
+        f.write("-" * 75 + "\n\n")
+
+        for banda, met in resultados_por_banda.items():
+            bmin, bmax = BANDAS[banda]
+            f.write(f"  +- {banda.upper()} ({bmin}-{bmax} Hz) {'-' * (44 - len(banda))}\n")
+
+            if met is None:
+                f.write("  |  Dados insuficientes nesta banda.\n")
+                f.write("  +" + "-" * 50 + "\n\n")
+                continue
+
+            f.write("  |\n")
+            f.write("  |  ORIGINAL (Welch medio, sem decomposicao):\n")
+            f.write(f"  |    PSD media : {met['psd_media_original']:.5f} uV2/Hz\n")
+            f.write(f"  |    Area      : {met['area_original']:.5f} uV2\n")
+            f.write("  |\n")
+            f.write("  |  APERIODICO (ruido de fundo 1/f):\n")
+            f.write(f"  |    PSD media : {met['psd_media_aperiodic']:.5f} uV2/Hz\n")
+            f.write(f"  |    Area      : {met['area_aperiodic']:.5f} uV2\n")
+            f.write("  |\n")
+            f.write("  |  PERIODICO (oscilacoes reais):\n")
+            f.write(f"  |    PSD media : {met['psd_media_periodic']:.5f} uV2/Hz\n")
+            f.write(f"  |    Area      : {met['area_periodic']:.5f} uV2\n")
+
+            if fm is not None:
+                peaks_raw = getattr(fm, "peak_params_", None)
+                if peaks_raw is not None and len(peaks_raw) > 0:
+                    pk_arr      = np.array(peaks_raw)
+                    mask        = (pk_arr[:, 0] >= bmin) & (pk_arr[:, 0] <= bmax)
+                    picos_banda = pk_arr[mask]
+
+                    if len(picos_banda) > 0:
+                        f.write("  |\n")
+                        f.write(f"  |  PICOS FOOOF ({len(picos_banda)} encontrado(s)):\n")
+                        ap_fit = fm._ap_fit if hasattr(fm, "_ap_fit") else None
+                        freqs_fm = resultado_fooof_freqs if "resultado_fooof_freqs" in dir() else None
+
+                        for j, (freq_pk, amp_pk, bw_pk) in enumerate(picos_banda, 1):
+                            psd_abs = (10 ** amp_pk - 1) * 1e12  # aproximação segura sem freqs_fm
+                            if ap_fit is not None and fm is not None:
+                                try:
+                                    idx_pk  = int(np.argmin(np.abs(fm._ap_fit * 0 +
+                                              np.arange(len(fm._ap_fit)) - 0)))
+                                    # Usar a amplitude diretamente sobre o aperiódico médio da banda
+                                    ap_mean_log = np.mean(np.log10(
+                                        met['psd_media_aperiodic'] / 1e12 +
+                                        1e-30))
+                                    psd_abs = (10 ** (ap_mean_log + amp_pk) -
+                                               10 ** ap_mean_log) * 1e12
+                                except Exception:
+                                    pass
+
+                            f.write(f"  |    Pico {j}:\n")
+                            f.write(f"  |      Frequencia   : {freq_pk:.2f} Hz\n")
+                            f.write(f"  |      PSD no pico  : {psd_abs:.5f} uV2/Hz\n")
+                            f.write(f"  |      Largura (BW) : {bw_pk:.2f} Hz\n")
+                            f.write(f"  |      Amp. log     : {amp_pk:.4f} [unidade interna FOOOF]\n")
+                    else:
+                        f.write("  |\n")
+                        f.write("  |  PICOS: nenhum detectado nesta banda.\n")
+
+            f.write("  +" + "-" * 50 + "\n\n")
+
+        # Seção 3
+        f.write("-" * 75 + "\n")
+        f.write("3. PSD BRUTO POR SEGMENTO -- APENAS CONTROLE DE QUALIDADE\n")
+        f.write("   ATENCAO: valores abaixo SAO o Welch cru, SEM decomposicao FOOOF.\n")
+        f.write("   Incluem ruido 1/f.\n")
+        f.write("-" * 75 + "\n\n")
+
+        if inicios_intervalos is None or psds_brutos is None:
+            f.write("  (dados por segmento nao disponiveis)\n")
+        else:
+            for k, (inicio_s, psd_raw) in enumerate(
+                    zip(inicios_intervalos, psds_brutos), 1):
+                fim_s = inicio_s + DURACAO_INTERVALO
+                f.write(f"  Segmento {k:02d}: {inicio_s:.0f}s - {fim_s:.0f}s\n")
+
+                if psd_raw is None:
+                    f.write("    Invalido (fora da duracao ou falha no Welch)\n\n")
+                    continue
+
+                freqs_int, pxx_int = psd_raw
+                for banda, (bmin, bmax) in BANDAS.items():
+                    idxb    = idx_range(freqs_int, bmin, bmax)
+                    if idxb.sum() < 3:
+                        continue
+                    f_b      = freqs_int[idxb]
+                    p_b      = pxx_int[idxb] * 1e12
+                    psd_m    = float(np.mean(p_b))
+                    area     = float(np.trapezoid(p_b, f_b))
+                    psd_max  = float(np.max(p_b))
+                    freq_max = float(f_b[np.argmax(p_b)])
+                    f.write(
+                        f"    {banda.upper():5s} ({bmin:.0f}-{bmax:.0f} Hz): "
+                        f"PSD media={psd_m:.5f} uV2/Hz | "
+                        f"Area={area:.5f} uV2 | "
+                        f"Pico={psd_max:.5f} uV2/Hz  {freq_max:.2f} Hz\n"
+                    )
+                f.write("\n")
+
+        f.write("=" * 75 + "\n")
+
+
+# =========================
+# MAIN
+# =========================
+if __name__ == "__main__":
+
+    intervalos_planilha = carregar_intervalos_planilha(PLANILHA_PATH)
+    if not intervalos_planilha:
+        raise SystemExit("Nao foi possivel ler intervalos da planilha.")
+
+    log_geral = {
+        "timestamp":  datetime.now().isoformat(),
+        "referencia": "Donoghue et al. (2020) Nature Neuroscience",
+        "planilha":   PLANILHA_PATH,
+        "saida":      PASTA_SAIDA,
+        "parametros": {
+            "duracao_intervalo_s": DURACAO_INTERVALO,
+            "fmin_global":         FMIN_GLOBAL,
+            "fmax_global":         FMAX_GLOBAL,
+            "bandas":              BANDAS,
+            "welch_win_sec":       WELCH_WIN_SEC,
+            "welch_overlap_frac":  WELCH_OVERLAP_FRAC,
+            "nfft_min":            NFFT_MIN,
+            "fooof_config":        FOOOF_CONFIG,
+            "fooof_r2_min":        FOOOF_R2_MIN,
+            "fooof_err_max":       FOOOF_ERR_MAX,
+        },
+        "ambiente": {
+            "python":   platform.python_version(),
+            "mne":      mne.__version__,
+            "platform": platform.platform(),
+        },
+        "arquivos_processados": []
+    }
+
+    print("\n" + "=" * 80)
+    print("ANALISE EEG - FOOOF")
+    print("Pipeline: Welch por segmento -> media PSD -> FOOOF 1x -> metricas")
+    print("=" * 80)
+
+    for nome_arquivo in sorted(os.listdir(PASTA_SET)):
+        if not nome_arquivo.endswith(".set"):
+            continue
+
+        caminho     = os.path.join(PASTA_SET, nome_arquivo)
+        paciente_id = Path(caminho).stem
+
+        chave_encontrada = None
+        if paciente_id in intervalos_planilha:
+            chave_encontrada = paciente_id
+        else:
+            for chave in intervalos_planilha:
+                if str(chave) in paciente_id or paciente_id in str(chave):
+                    chave_encontrada = chave
+                    break
+
+        if chave_encontrada is None:
+            print(f"  '{paciente_id}' nao encontrado na planilha -- pulando")
+            continue
+
+        print(f"\n> {nome_arquivo}  |  ID: {paciente_id}")
+
+        item_log = {
+            "id": paciente_id, "arquivo": caminho,
+            "processado": True, "sfreq": None,
+            "duracao_s": None,  "n_canais": None,
+            "falhas_segmento": 0, "canais": {}
+        }
+
+        try:
+            raw       = mne.io.read_raw_eeglab(caminho, preload=True)
+            data      = raw.get_data()
+            sfreq     = float(raw.info["sfreq"])
+            ch_names  = list(raw.info["ch_names"])
+            dur_total = data.shape[1] / sfreq
+
+            item_log.update({"sfreq": sfreq,
+                             "duracao_s": float(dur_total),
+                             "n_canais":  int(len(ch_names))})
+
+            print(f"   {dur_total:.1f}s | {len(ch_names)} canais | {sfreq:.0f} Hz")
+
+            ints = intervalos_planilha[chave_encontrada]
+
+            for ch_idx, canal in enumerate(ch_names):
+                sig = data[ch_idx, :]
+                if np.all(sig == 0):
+                    continue
+
+                print(f"   Canal {canal} ...", end=" ", flush=True)
+                item_log["canais"][canal] = {}
+
+                foo = None  # garante que foo existe para o print ao final do canal
+
+                for cond in ["OA", "OF"]:
+                    inicios   = ints[cond]
+                    psds      = []
+                    freqs_ref = None
+                    usados    = 0
+                    psds_brutos_por_segmento = []
+                    inicios_todos = []
+
+                    for inicio_s in inicios:
+                        inicios_todos.append(inicio_s)
+
+                        if inicio_s + DURACAO_INTERVALO > dur_total:
+                            item_log["falhas_segmento"] += 1
+                            psds_brutos_por_segmento.append(None)
+                            continue
+
+                        seg = extrair_segmento(sig, sfreq, inicio_s, DURACAO_INTERVALO)
+                        if seg is None or seg.size < int(sfreq):
+                            item_log["falhas_segmento"] += 1
+                            psds_brutos_por_segmento.append(None)
+                            continue
+
+                        freqs, pxx = welch_psd(seg, sfreq)
+                        if freqs is None:
+                            item_log["falhas_segmento"] += 1
+                            psds_brutos_por_segmento.append(None)
+                            continue
+
+                        idxg    = idx_range(freqs, FMIN_GLOBAL, FMAX_GLOBAL)
+                        freqs_g = freqs[idxg]
+                        pxx_g   = pxx[idxg]
+
+                        if (idxg.sum() < 20 or
+                                np.any(~np.isfinite(pxx_g)) or
+                                np.any(pxx_g <= 0)):
+                            item_log["falhas_segmento"] += 1
+                            psds_brutos_por_segmento.append(None)
+                            continue
+
+                        psds_brutos_por_segmento.append((freqs, pxx))
+
+                        if freqs_ref is None:
+                            freqs_ref = freqs_g
+                        elif (len(freqs_g) != len(freqs_ref) or
+                              not np.allclose(freqs_g, freqs_ref)):
+                            pxx_g = np.interp(freqs_ref, freqs_g, pxx_g)
+
+                        psds.append(pxx_g)
+                        usados += 1
+
+                    item_log["canais"][canal][cond] = {
+                        "segmentos_validos": usados,
+                        "segmentos_total":   NUM_INTERVALOS_OA,
+                    }
+
+                    if usados < 1:
+                        continue
+
+                    psd_med = np.mean(np.stack(psds, axis=0), axis=0)
+
+                    foo = ajustar_fooof_no_psd_medio(freqs_ref, psd_med)
+                    if foo is None:
+                        item_log["canais"][canal][cond]["fooof_ok"] = False
+                        continue
+
+                    item_log["canais"][canal][cond].update({
+                        "fooof_ok": bool(foo["ok"]),
+                        "r2":       float(foo["r2"]),
+                        "err":      float(foo["err"]),
+                        "expoente": float(foo["ap_params"][1])
+                                    if len(foo["ap_params"]) >= 2 else None,
+                    })
+
+                    resultados_bandas = {}
+                    for banda_nome, (bmin, bmax) in BANDAS.items():
+                        met = metricas_por_banda(
+                            foo["freqs"], foo["orig_micro"],
+                            foo["ap_micro"], foo["periodic_micro"],
+                            bmin, bmax
+                        )
+                        resultados_bandas[banda_nome] = met
+
+                        plot_zoom_banda_com_stats(
+                            resultado_fooof=foo,
+                            banda_nome=banda_nome,
+                            canal=canal, cond=cond,
+                            paciente_id=paciente_id,
+                            pasta_saida=PASTA_SAIDA,
+                            fmin_b=bmin, fmax_b=bmax,
+                            n_validos=usados,
+                        )
+
+                    fooof_info_txt = {
+                        "ok":        foo["ok"],
+                        "r2":        foo["r2"],
+                        "err":       foo["err"],
+                        "fm":        foo["fm"],
+                        "ap_params": foo["ap_params"],
+                    }
+                    salvar_txt_resumo(
+                        pasta_saida=PASTA_SAIDA,
+                        paciente_id=paciente_id,
+                        canal=canal, cond=cond,
+                        n_validos=usados,
+                        resultados_por_banda=resultados_bandas,
+                        fooof_info=fooof_info_txt,
+                        inicios_intervalos=inicios_todos,
+                        psds_brutos=psds_brutos_por_segmento,
+                    )
+
+                # Print de status por canal
+                if foo is not None and len(foo.get("ap_params", [])) >= 2:
+                    print(f"OK (R2={foo['r2']:.2f} | exp={foo['ap_params'][1]:.3f})")
+                else:
+                    print("OK")
+
+                # Liberar memória após cada canal
+                gc.collect()
+
+        except Exception as e:
+            item_log["processado"] = False
+            item_log["erro"]       = str(e)
+            print(f"\nErro em {nome_arquivo}: {e}")
+            import traceback; traceback.print_exc()
+
+        log_geral["arquivos_processados"].append(item_log)
+
+    ts       = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_path = os.path.join(PASTA_SAIDA, f"ANALISE_LOG_{ts}.json")
+    salvar_json(log_path, log_geral)
+
+    print("\n" + "=" * 80)
+    print("PROCESSAMENTO CONCLUIDO!")
+    print(f"Saida : {PASTA_SAIDA}")
+    print(f"Log   : {log_path}")
+    print("=" * 80)
