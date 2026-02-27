@@ -1,11 +1,3 @@
- ============================================================
-# EEG ANALYSIS — FOOOF + PLOTS PARA PUBLICAÇÃO
-# Pipeline: Welch por segmento -> média PSD -> FOOOF 1x -> métricas
-# Plot: 3 painéis (espectro completo | periódico + gaussianas | E/I barplot)
-# Estilo: Frontiers / PLOS / Brain Sciences — DPI 300
-# Referência: Donoghue et al. (2020) Nature Neuroscience
-# ============================================================
-
 import os
 import json
 import platform
@@ -21,7 +13,6 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
-from matplotlib.gridspec import GridSpec
 from matplotlib.lines import Line2D
 from scipy.signal import welch
 from fooof import FOOOF
@@ -88,7 +79,7 @@ BANDAS_PLOT = {
 # =========================
 PASTA_SET      = r'C:/Users/meloliveira/Documents/eeg'
 PLANILHA_PATH  = r'C:/Users/meloliveira/Documents/intervalos_pacientes.xlsx'
-SUBPASTA_SAIDA = "sol11"
+SUBPASTA_SAIDA = "sol12"
 PASTA_SAIDA    = os.path.join(PASTA_SET, SUBPASTA_SAIDA)
 os.makedirs(PASTA_SAIDA, exist_ok=True)
 
@@ -133,7 +124,6 @@ def extrair_segmento(sig_1d, sfreq, inicio_s, dur_s):
     if fim <= ini:
         return None
     return sig_1d[ini:fim]
-
 
 def welch_psd(sig_1d, sfreq):
     n = sig_1d.shape[0]
@@ -259,215 +249,100 @@ def calcular_ci95(psds_list, freqs_ref):
 
 
 # =========================
-# GAUSSIANA FOOOF
+# PLOT comparacao
 # =========================
-def _gaussiana(cf, amp, bw, freqs):
-    """Reconstrói gaussiana individual do FOOOF (amplitude em log-space → µV²/Hz)."""
-    return amp * np.exp(-0.5 * ((freqs - cf) / (bw / 2)) ** 2) * 1e12
-
-
-# =========================
-# PLOT PARA PUBLICAÇÃO
-# 3 painéis:
-#   A — Espectro completo (log Y) OA vs OF + IC 95% + aperiódico + bandas
-#   B — Periódico isolado OA vs OF + gaussianas FOOOF individuais
-#   C — Barplot expoente aperiódico OA vs OF (E/I balance)
-# =========================
-def plot_publicacao(paciente_id, canal, pasta_saida,
+def plot_comparacao(paciente_id, canal, pasta_saida,
                     freqs_ref_oa, psd_med_oa, psds_ind_oa, foo_oa,
                     freqs_ref_of, psd_med_of, psds_ind_of, foo_of):
     """
-    Gera figura de 3 painéis pronta para publicação (DPI 300).
-
-    Parâmetros
-    ----------
-    psds_ind_oa / psds_ind_of : listas de arrays PSD individuais em V²/Hz
-                                 (SEM *1e12) — usados para calcular IC 95%
-    foo_oa / foo_of           : dicts retornados por ajustar_fooof_no_psd_medio()
-                                 ou None se FOOOF falhou
+    Gera figura — Painel único: Espectro completo (log Y) OA vs OF.
+      - IC 95% sombreado dos 10 segmentos
+      - Curva aperiódica tracejada (FOOOF)
+      - Bandas δ θ α β sombreadas e anotadas
+      - DPI 300, estilo Frontiers
     """
 
     plt.rcParams.update({
         "font.family":       "DejaVu Sans",
-        "font.size":         10,
-        "axes.titlesize":    11,
-        "axes.labelsize":    10,
-        "xtick.labelsize":   9,
-        "ytick.labelsize":   9,
+        "font.size":         11,
+        "axes.titlesize":    12,
+        "axes.labelsize":    11,
+        "xtick.labelsize":   10,
+        "ytick.labelsize":   10,
         "axes.spines.top":   False,
         "axes.spines.right": False,
     })
 
-    fig = plt.figure(figsize=(18, 6), facecolor="white", constrained_layout=True)
-    gs  = GridSpec(1, 3, figure=fig, width_ratios=[5, 4, 2])
-    ax_a = fig.add_subplot(gs[0])
-    ax_b = fig.add_subplot(gs[1])
-    ax_c = fig.add_subplot(gs[2])
+    fig, ax = plt.subplots(figsize=(9, 6), facecolor="white",
+                           constrained_layout=True)
 
-    # ── Prepara arrays em µV²/Hz ────────────────────────────────────────────
+    # ── Prepara arrays em µV²/Hz ─────────────────────────────────────────────
     def _prep(freqs_ref, psd_med, psds_ind, foo):
-        idx  = idx_range(freqs_ref, FMIN_GLOBAL, FMAX_GLOBAL)
-        f    = freqs_ref[idx]
-        p    = psd_med[idx] * 1e12
+        idx = idx_range(freqs_ref, FMIN_GLOBAL, FMAX_GLOBAL)
+        f   = freqs_ref[idx]
+        p   = psd_med[idx] * 1e12
 
-        mean_ci, lo_ci, hi_ci = calcular_ci95(psds_ind, freqs_ref)
-        if mean_ci is not None:
-            mean_ci = mean_ci[idx]
-            lo_ci   = lo_ci[idx]
-            hi_ci   = hi_ci[idx]
+        _, lo_ci, hi_ci = calcular_ci95(psds_ind, freqs_ref)
+        if lo_ci is not None:
+            lo_ci = lo_ci[idx]
+            hi_ci = hi_ci[idx]
 
-        ap   = (10 ** foo["fm"]._ap_fit)           * 1e12 if foo else None
-        per  = foo["periodic_micro"]                       if foo else None
-        fq   = foo["freqs"]                                if foo else f
+        ap = (10 ** foo["fm"]._ap_fit) * 1e12 if foo else None
+        fq = foo["freqs"]              if foo else f
 
-        return f, p, lo_ci, hi_ci, ap, per, fq
+        return f, p, lo_ci, hi_ci, ap, fq
 
-    f_oa, p_oa, lo_oa, hi_oa, ap_oa, per_oa, fq_oa = _prep(
+    f_oa, p_oa, lo_oa, hi_oa, ap_oa, fq_oa = _prep(
         freqs_ref_oa, psd_med_oa, psds_ind_oa, foo_oa)
-    f_of, p_of, lo_of, hi_of, ap_of, per_of, fq_of = _prep(
+    f_of, p_of, lo_of, hi_of, ap_of, fq_of = _prep(
         freqs_ref_of, psd_med_of, psds_ind_of, foo_of)
 
-    exp_oa = foo_oa["ap_params"][1] if (foo_oa and len(foo_oa["ap_params"]) >= 2) else None
-    exp_of = foo_of["ap_params"][1] if (foo_of and len(foo_of["ap_params"]) >= 2) else None
-
-    # ── Helper: sombrear bandas ─────────────────────────────────────────────
-    def _bandas(ax, yref_transform=False):
-        for nome, (bmin, bmax, cor, alpha) in BANDAS_PLOT.items():
-            ax.axvspan(bmin, bmax, color=cor, alpha=alpha, zorder=0)
-            if yref_transform:
-                ax.text((bmin + bmax) / 2, 0.97, nome,
-                        ha="center", va="top", fontsize=8.5,
-                        color="#555", fontstyle="italic",
-                        transform=ax.get_xaxis_transform())
-            else:
-                ylim = ax.get_ylim()
-                ax.text((bmin + bmax) / 2, ylim[1] * 0.96, nome,
-                        ha="center", va="top", fontsize=8.5,
-                        color="#555", fontstyle="italic")
-
-    # ════════════════════════════════════════════════════════════════════════
-    # PAINEL A — Espectro completo (escala log Y)
-    # ════════════════════════════════════════════════════════════════════════
-
-    # IC 95% sombreado
+    # ── IC 95% sombreado ─────────────────────────────────────────────────────
     if lo_oa is not None:
-        ax_a.fill_between(f_oa, lo_oa, hi_oa, color=COR_OA, alpha=0.15, zorder=1)
+        ax.fill_between(f_oa, lo_oa, hi_oa, color=COR_OA, alpha=0.15, zorder=1)
     if lo_of is not None:
-        ax_a.fill_between(f_of, lo_of, hi_of, color=COR_OF, alpha=0.15, zorder=1)
+        ax.fill_between(f_of, lo_of, hi_of, color=COR_OF, alpha=0.15, zorder=1)
 
-    # Aperiódico tracejado
+    # ── Aperiódico tracejado ─────────────────────────────────────────────────
     if ap_oa is not None:
-        ax_a.semilogy(fq_oa, ap_oa, color=COR_AP_OA, ls="--", lw=1.4, alpha=0.85, zorder=2)
+        ax.semilogy(fq_oa, ap_oa, color=COR_AP_OA, ls="--", lw=1.4,
+                    alpha=0.85, zorder=2)
     if ap_of is not None:
-        ax_a.semilogy(fq_of, ap_of, color=COR_AP_OF, ls="--", lw=1.4, alpha=0.85, zorder=2)
+        ax.semilogy(fq_of, ap_of, color=COR_AP_OF, ls="--", lw=1.4,
+                    alpha=0.85, zorder=2)
 
-    # Espectro médio
-    ax_a.semilogy(f_oa, p_oa, color=COR_OA, lw=2.2, zorder=3)
-    ax_a.semilogy(f_of, p_of, color=COR_OF, lw=2.2, zorder=3)
+    # ── Espectro médio ───────────────────────────────────────────────────────
+    ax.semilogy(f_oa, p_oa, color=COR_OA, lw=2.2, zorder=3)
+    ax.semilogy(f_of, p_of, color=COR_OF, lw=2.2, zorder=3)
 
-    ax_a.set_xlim(FMIN_GLOBAL, FMAX_GLOBAL)
-    ax_a.set_xlabel("Frequency (Hz)")
-    ax_a.set_ylabel("Power Spectral Density (µV²/Hz)")
-    ax_a.set_title("A  —  Power Spectrum", fontweight="bold", loc="left", pad=8)
-    _bandas(ax_a, yref_transform=True)
+    # ── Bandas sombreadas + labels ───────────────────────────────────────────
+    for nome, (bmin, bmax, cor, alpha) in BANDAS_PLOT.items():
+        ax.axvspan(bmin, bmax, color=cor, alpha=alpha, zorder=0)
+        ax.text((bmin + bmax) / 2, 0.97, nome,
+                ha="center", va="top", fontsize=9,
+                color="#555", fontstyle="italic",
+                transform=ax.get_xaxis_transform())
 
-    leg_a = [
-        Line2D([0],[0], color=COR_OA, lw=2,   label="Eyes Open (OA)"),
-        Line2D([0],[0], color=COR_OF, lw=2,   label="Eyes Closed (OF)"),
+    # ── Formatação ───────────────────────────────────────────────────────────
+    ax.set_xlim(FMIN_GLOBAL, FMAX_GLOBAL)
+    ax.set_xlabel("Frequency (Hz)")
+    ax.set_ylabel("Power Spectral Density (µV²/Hz)")
+    ax.set_title(f"Power Spectrum  |  {paciente_id}  —  Channel {canal}  (Pre-intervention)",
+                 fontweight="bold", loc="left", pad=10)
+    ax.grid(True, which="both", ls=":", alpha=0.25, color="gray")
+
+    # ── Legenda ──────────────────────────────────────────────────────────────
+    r2_oa = f"R²={foo_oa['r2']:.3f}" if foo_oa else "N/A"
+    r2_of = f"R²={foo_of['r2']:.3f}" if foo_of else "N/A"
+
+    leg = [
+        Line2D([0],[0], color=COR_OA, lw=2.2, label=f"Eyes Open ({r2_oa})"),
+        Line2D([0],[0], color=COR_OF, lw=2.2, label=f"Eyes Closed ({r2_of})"),
         mpatches.Patch(color=COR_OA, alpha=0.25, label="95% CI (OA)"),
         mpatches.Patch(color=COR_OF, alpha=0.25, label="95% CI (OF)"),
-        Line2D([0],[0], color="#999", lw=1.3, ls="--", label="Aperiodic fit"),
+        Line2D([0],[0], color="#999", lw=1.4, ls="--", label="Aperiodic fit (FOOOF)"),
     ]
-    ax_a.legend(handles=leg_a, fontsize=8.5, frameon=False, loc="upper right")
-    ax_a.grid(True, which="both", ls=":", alpha=0.25, color="gray")
-
-    # ════════════════════════════════════════════════════════════════════════
-    # PAINEL B — Periódico isolado + gaussianas FOOOF
-    # ════════════════════════════════════════════════════════════════════════
-
-    if per_oa is not None:
-        ax_b.plot(fq_oa, per_oa, color=COR_OA, lw=2.2, zorder=3)
-        ax_b.fill_between(fq_oa, 0, per_oa, color=COR_OA, alpha=0.12, zorder=2)
-
-    if per_of is not None:
-        ax_b.plot(fq_of, per_of, color=COR_OF, lw=2.2, zorder=3)
-        ax_b.fill_between(fq_of, 0, per_of, color=COR_OF, alpha=0.12, zorder=2)
-
-    # Gaussianas individuais — mostram EXATAMENTE onde o FOOOF detectou picos
-    def _plot_gaussianas(ax, foo, fq, cor_gauss):
-        if foo is None:
-            return
-        peaks = getattr(foo["fm"], "gaussian_params_", None)
-        if peaks is None or len(peaks) == 0:
-            return
-        ylim_now = ax.get_ylim()
-        for cf, amp, bw in np.array(peaks):
-            curva = _gaussiana(cf, amp, bw, fq)
-            ax.plot(fq, curva, color=cor_gauss, lw=1.4, ls="-.", alpha=0.9, zorder=4)
-            ax.axvline(cf, color=cor_gauss, lw=0.9, ls=":", alpha=0.75, zorder=4)
-            ax.text(cf + 0.35, ylim_now[1] * 0.06 if ylim_now[1] > 0 else 0.01,
-                    f"{cf:.1f} Hz", fontsize=7.5,
-                    color=cor_gauss, fontweight="bold", va="bottom")
-
-    _plot_gaussianas(ax_b, foo_oa, fq_oa, "#1A6399")
-    _plot_gaussianas(ax_b, foo_of, fq_of, "#B22222")
-
-    ax_b.axhline(0, color="black", lw=0.6)
-    ax_b.set_xlim(FMIN_GLOBAL, FMAX_GLOBAL)
-    ax_b.set_xlabel("Frequency (Hz)")
-    ax_b.set_ylabel("Periodic Power (µV²/Hz)")
-    ax_b.set_title("B  —  Periodic Component (FOOOF)", fontweight="bold", loc="left", pad=8)
-    _bandas(ax_b)
-
-    leg_b = [
-        Line2D([0],[0], color=COR_OA, lw=2,   label="Eyes Open (OA)"),
-        Line2D([0],[0], color=COR_OF, lw=2,   label="Eyes Closed (OF)"),
-        Line2D([0],[0], color="#555", lw=1.3, ls="-.", label="FOOOF gaussian peak"),
-    ]
-    ax_b.legend(handles=leg_b, fontsize=8.5, frameon=False, loc="upper right")
-    ax_b.grid(True, ls=":", alpha=0.25, color="gray")
-
-    # ════════════════════════════════════════════════════════════════════════
-    # PAINEL C — Barplot expoente aperiódico (E/I balance)
-    # ════════════════════════════════════════════════════════════════════════
-
-    labels  = ["Eyes\nOpen", "Eyes\nClosed"]
-    valores = [exp_oa if exp_oa is not None else 0,
-               exp_of if exp_of is not None else 0]
-    validos = [exp_oa is not None, exp_of is not None]
-
-    bars = ax_c.bar(labels, valores, color=[COR_OA, COR_OF],
-                    width=0.5, edgecolor="white", lw=0.8, alpha=0.88, zorder=2)
-
-    vmax = max([v for v, ok in zip(valores, validos) if ok] or [1])
-    for bar, val, ok in zip(bars, valores, validos):
-        txt = f"{val:.3f}" if ok else "N/A"
-        ax_c.text(bar.get_x() + bar.get_width() / 2,
-                  val + vmax * 0.03, txt,
-                  ha="center", va="bottom",
-                  fontsize=9.5, fontweight="bold", color="#222")
-
-    ax_c.set_ylabel("Aperiodic Exponent (1/f slope)")
-    ax_c.set_title("C  —  E/I Balance", fontweight="bold", loc="left", pad=8)
-    ax_c.set_ylim(0, vmax * 1.30)
-    ax_c.axhline(0, color="black", lw=0.6)
-    ax_c.grid(True, axis="y", ls=":", alpha=0.3, color="gray")
-    ax_c.text(0.5, 0.03, "Higher = more\ninhibitory dominance",
-              ha="center", transform=ax_c.transAxes,
-              fontsize=7.5, color="#777", fontstyle="italic")
-
-    # ── Título geral ─────────────────────────────────────────────────────────
-    r2_oa = f"{foo_oa['r2']:.3f}" if foo_oa else "N/A"
-    r2_of = f"{foo_of['r2']:.3f}" if foo_of else "N/A"
-    ok_oa = "✓" if (foo_oa and foo_oa["ok"]) else "✗"
-    ok_of = "✓" if (foo_of and foo_of["ok"]) else "✗"
-
-    fig.suptitle(
-        f"EEG Spectral Analysis  |  {paciente_id}  —  Channel {canal}  (Pre-intervention)\n"
-        f"FOOOF fit: OA R²={r2_oa} {ok_oa}  |  OF R²={r2_of} {ok_of}"
-        f"   [Donoghue et al., 2020]",
-        fontsize=10.5, fontweight="bold", color="#222", y=1.02
-    )
+    ax.legend(handles=leg, fontsize=9, frameon=False, loc="upper right")
 
     # ── Salvar ───────────────────────────────────────────────────────────────
     nome_png = f"{paciente_id}_{canal}_FOOOF_PUB.png"
@@ -491,7 +366,6 @@ def salvar_txt_resumo(pasta_saida, paciente_id, canal, cond, n_validos,
 
         f.write("=" * 75 + "\n")
         f.write("ANALISE EEG/FOOOF COMPLETA\n")
-        f.write("Referencia: Donoghue et al. (2020) Nature Neuroscience\n")
         f.write("=" * 75 + "\n")
         f.write(f"Paciente          : {paciente_id}\n")
         f.write(f"Canal             : {canal}\n")
@@ -666,7 +540,6 @@ if __name__ == "__main__":
     print("\n" + "=" * 80)
     print("ANALISE EEG - FOOOF")
     print("Pipeline: Welch por segmento -> media PSD -> FOOOF 1x -> metricas")
-    print("Plot: 3 painéis para publicação (DPI 300)")
     print("=" * 80)
 
     for nome_arquivo in sorted(os.listdir(PASTA_SET)):
@@ -857,7 +730,7 @@ if __name__ == "__main__":
                     if d_of is None and d_oa is not None:
                         d_of = _fallback(d_oa)
 
-                    plot_publicacao(
+                    plot_imagem(
                         paciente_id=paciente_id,
                         canal=canal,
                         pasta_saida=PASTA_SAIDA,
