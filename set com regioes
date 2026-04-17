@@ -1,0 +1,1340 @@
+import os
+import re
+import numpy as np
+import pandas as pd
+import mne
+import matplotlib.pyplot as plt
+from scipy.signal import welch
+from fooof import FOOOF
+import warnings
+import json
+import platform
+from datetime import datetime
+import tkinter as tk
+from tkinter import filedialog
+from collections import defaultdict
+
+# Silenciar avisos
+mne.set_log_level('WARNING')
+warnings.filterwarnings("ignore", category=DeprecationWarning, module=r"^fooof(\.|$)")
+warnings.filterwarnings("ignore", category=RuntimeWarning, message=r"^Limited .* annotation\(s\)")
+warnings.filterwarnings("ignore", category=RuntimeWarning, message=r"^The data contains 'boundary' events.*")
+
+R2_THRESHOLD = 0.75   # usado tanto no FOOOF quanto no contador de válidos
+
+# ============================================================
+# Definição de regiões de canais
+# ============================================================
+
+# Regiões amplas: todos os canais cujo nome começa com a letra da região
+REGIOES_AMPLAS = {
+    'Frontal':   lambda ch: re.match(r'^F[^Cz]', ch, re.IGNORECASE) is not None or ch.upper().startswith('F'),
+    'Parietal':  lambda ch: ch.upper().startswith('P'),
+    'Occipital': lambda ch: ch.upper().startswith('O'),
+    'Temporal':  lambda ch: ch.upper().startswith('T'),
+}
+
+# Prefixos simples para cada região ampla (mais robusto que lambda complexo)
+REGIOES_AMPLAS_PREFIXOS = {
+    'Frontal':   'F',
+    'Parietal':  'P',
+    'Occipital': 'O',
+    'Temporal':  'T',
+}
+
+# Regiões específicas: conjuntos exatos de canais (case-insensitive)
+REGIOES_ESPECIFICAS = {
+    'F_especifico':  ['F3', 'F4', 'FZ', 'Fz'],
+    'P_especifico':  ['P3', 'P4', 'PZ', 'Pz'],
+    'O_especifico':  ['O1', 'O2', 'OZ', 'Oz'],
+}
+
+
+def canal_pertence_regiao_ampla(nome_canal, prefixo):
+    """Retorna True se o canal pertence à região ampla (pelo prefixo da letra)."""
+    return nome_canal.upper().startswith(prefixo.upper())
+
+
+def canal_pertence_regiao_especifica(nome_canal, lista_canais):
+    """Retorna True se o canal está na lista específica (case-insensitive)."""
+    return nome_canal.upper() in [c.upper() for c in lista_canais]
+
+
+# ============================================================
+# Extrai prefixo canônico  ex: "50_T0"
+# ============================================================
+
+def extrair_prefixo(nome: str) -> str:
+    m = re.search(r'(\d+_T\d+)', nome, re.IGNORECASE)
+    if m:
+        return m.group(1).upper()
+    return nome.strip().lower()
+
+
+# ============================================================
+# Seleção de arquivo
+# ============================================================
+
+def escolher_arquivo_set():
+    root = tk.Tk()
+    root.withdraw()
+    arquivo = filedialog.askopenfilename(
+        title="Selecione o arquivo EEG (.set)",
+        filetypes=[("EEGLAB .set", "*.set"), ("Todos os arquivos", "*.*")]
+    )
+    if not arquivo:
+        raise ValueError("Nenhum arquivo EEG selecionado.")
+    return arquivo
+
+
+def escolher_planilha_intervalos():
+    root = tk.Tk()
+    root.withdraw()
+    arquivo = filedialog.askopenfilename(
+        title="Selecione a planilha de intervalos",
+        filetypes=[("Excel", "*.xlsx *.xls"), ("Todos os arquivos", "*.*")]
+    )
+    if not arquivo:
+        raise ValueError("Nenhuma planilha selecionada.")
+    return arquivo
+
+
+def salvar_log_json(caminho_log, payload: dict):
+    with open(caminho_log, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, ensure_ascii=False)
+
+
+# ============================================================
+# Detecção e normalização de unidade do sinal
+# ============================================================
+
+def detectar_unidade_canal(raw):
+    try:
+        from mne.io.constants import FIFF
+        eeg_chs = [ch for ch in raw.info['chs'] if ch['kind'] == FIFF.FIFFV_EEG_CH]
+        if eeg_chs:
+            unit_code = eeg_chs[0]['unit']
+            if unit_code == FIFF.FIFF_UNIT_V:
+                print("  [Unidade] Campo FIFF indica Volts → convertendo para µV (×1e6)")
+                return False
+            else:
+                print(f"  [Unidade] Campo FIFF unit={unit_code} → assumindo µV (sem conversão)")
+                return True
+    except Exception:
+        pass
+
+    amostra = raw.get_data(start=0, stop=min(2000, raw.n_times))
+    std_val = np.median(np.std(amostra, axis=1))
+    if std_val < 1e-3:
+        print(f"  [Unidade] Amplitude típica={std_val:.2e} → detectado Volts → convertendo para µV (×1e6)")
+        return False
+    else:
+        print(f"  [Unidade] Amplitude típica={std_val:.2e} → detectado µV (sem conversão)")
+        return True
+
+
+# ============================================================
+# Configurações
+# ============================================================
+DURACAO_INTERVALO = 6
+NUM_INTERVALOS_OLHOS_ABERTOS  = 10
+NUM_INTERVALOS_OLHOS_FECHADOS = 10
+MIN_INTERVALOS_VALIDOS        = 5
+
+FOOOF_FMIN = 1.0
+FOOOF_FMAX = 40.0
+
+bandas = {
+    'delta': (1.0,  4.0),
+    'theta': (4.1,  8.0),
+    'alpha': (8.1, 13.0),
+    'beta':  (13.1, 30.0),
+}
+
+fooof_config = {
+    'peak_width_limits': [1, 8],
+    'max_n_peaks':       3,
+    'min_peak_height':   0.1,
+    'peak_threshold':    2,
+    'aperiodic_mode':    'fixed',
+    'verbose':           False,
+}
+
+
+# ============================================================
+# Carregamento da planilha
+# ============================================================
+
+def carregar_intervalos_planilha(caminho_planilha):
+    try:
+        df = pd.read_excel(caminho_planilha)
+        intervalos_pacientes = {}
+
+        print("Estrutura da planilha:")
+        print(f"Colunas: {list(df.columns)}")
+        print(f"Primeiras linhas:\n{df.head()}")
+
+        for idx, row in df.iterrows():
+            nome_original = str(row.iloc[0]).strip()
+            chave = extrair_prefixo(nome_original)
+
+            olhos_abertos  = [int(row.iloc[i]) for i in range(1, 11)  if i < len(row) and not pd.isna(row.iloc[i])]
+            olhos_fechados = [int(row.iloc[i]) for i in range(11, 21) if i < len(row) and not pd.isna(row.iloc[i])]
+
+            if len(olhos_abertos) >= 10 and len(olhos_fechados) >= 10:
+                intervalos_pacientes[chave] = {
+                    'olhos_abertos':  olhos_abertos[:10],
+                    'olhos_fechados': olhos_fechados[:10],
+                    'nome_original':  nome_original,
+                }
+                print(f"  Carregado [{chave}] ('{nome_original}'): OA={olhos_abertos[:3]}... OF={olhos_fechados[:3]}...")
+            else:
+                print(f"  Aviso: [{chave}] — OA:{len(olhos_abertos)}, OF:{len(olhos_fechados)} intervalos")
+
+        return intervalos_pacientes
+
+    except Exception as e:
+        print(f"Erro ao carregar planilha: {e}")
+        return {}
+
+
+# ============================================================
+# Funções de sinal
+# ============================================================
+
+def _boundary_samples(raw):
+    b_samps = []
+    ann = getattr(raw, 'annotations', None)
+    if ann is None or len(ann) == 0:
+        return b_samps
+    for desc, onset, dur in zip(ann.description, ann.onset, ann.duration):
+        if isinstance(desc, str) and 'boundary' in desc.lower():
+            b_samps.append(raw.time_as_index(onset)[0])
+    return sorted(set(b_samps))
+
+
+def _contiguous_segments(n_samples, boundary_idxs, min_len):
+    if not boundary_idxs:
+        return [(0, n_samples)]
+    segs, last = [], 0
+    for b in boundary_idxs:
+        if b - last >= min_len:
+            segs.append((last, b))
+        last = b
+    if n_samples - last >= min_len:
+        segs.append((last, n_samples))
+    return segs
+
+
+def welch_discontinuous(signal, fs, nperseg, noverlap, nfft, segments):
+    sum_psd, sum_weights, freqs_ref = None, 0.0, None
+    step = nperseg - noverlap
+
+    for (s0, s1) in segments:
+        seg = signal[s0:s1]
+        if seg.size < nperseg:
+            continue
+        f_seg, pxx_seg = welch(seg, fs=fs, nperseg=nperseg, noverlap=noverlap, nfft=nfft)
+        nwin = max(int(1 + (seg.size - nperseg) // step), 1)
+
+        if freqs_ref is None:
+            freqs_ref = f_seg
+            sum_psd   = pxx_seg * nwin
+        else:
+            if len(f_seg) != len(freqs_ref) or not np.allclose(f_seg, freqs_ref):
+                pxx_seg = np.interp(freqs_ref, f_seg, pxx_seg)
+            sum_psd += pxx_seg * nwin
+        sum_weights += nwin
+
+    if sum_psd is None or sum_weights == 0:
+        return None, None
+    return freqs_ref, sum_psd / sum_weights
+
+
+def extrair_segmento_temporal(dados_completos, srate, inicio_seg, duracao_seg):
+    s0 = max(int(inicio_seg * srate), 0)
+    s1 = min(int((inicio_seg + duracao_seg) * srate), dados_completos.shape[1])
+    return dados_completos[:, s0:s1]
+
+
+# ============================================================
+# Reconstrução da componente periódica via gaussianas FOOOF
+# ============================================================
+
+def reconstruir_componente_periodica(fm, freqs):
+    comp_log = np.zeros_like(freqs, dtype=float)
+
+    if hasattr(fm, 'gaussian_params_') and fm.gaussian_params_ is not None and len(fm.gaussian_params_) > 0:
+        for cf, amp, bw in fm.gaussian_params_:
+            comp_log += amp * np.exp(-((freqs - cf) ** 2) / (2 * bw ** 2))
+
+    comp_linear = 10 ** comp_log - 1.0
+    comp_linear = np.maximum(comp_linear, 0.0)
+    return comp_linear
+
+
+# ============================================================
+# Média de PSD em log-espaço entre intervalos
+# ============================================================
+
+def media_psd_log(lista_psd_arrays):
+    validos = [a for a in lista_psd_arrays if a is not None and np.all(np.isfinite(a)) and np.all(a > 0)]
+    if not validos:
+        return None
+    log_arrays = [np.log10(a) for a in validos]
+    media_log  = np.mean(np.stack(log_arrays, axis=0), axis=0)
+    return 10 ** media_log, len(validos)
+
+
+# ============================================================
+# FOOOF — threshold unificado em R2_THRESHOLD
+# ============================================================
+
+def calcular_metricas_fooof_segmento(dados_segmento_canal, srate, nome_banda, fmin_banda, fmax_banda):
+    try:
+        if dados_segmento_canal.size == 0:
+            return None, "segmento vazio"
+        if np.all(dados_segmento_canal == 0):
+            return None, "sinal zerado"
+
+        nperseg = int(srate * 2)
+        if nperseg > dados_segmento_canal.shape[0]:
+            nperseg = dados_segmento_canal.shape[0]
+        noverlap = int(nperseg * 0.5)
+        nfft     = int(srate * 8)
+
+        freqs_full, psd_full = welch_discontinuous(
+            dados_segmento_canal, fs=srate,
+            nperseg=nperseg, noverlap=noverlap, nfft=nfft,
+            segments=[(0, dados_segmento_canal.shape[0])]
+        )
+        if freqs_full is None:
+            return None, "Welch falhou (segmento curto demais)"
+
+        psd_full_uv2 = psd_full
+
+        idx_ampla = (freqs_full >= FOOOF_FMIN) & (freqs_full <= FOOOF_FMAX)
+        if np.sum(idx_ampla) < 10:
+            return None, f"poucos pontos na faixa {FOOOF_FMIN}-{FOOOF_FMAX}Hz ({np.sum(idx_ampla)} pontos)"
+
+        freq_ampla = freqs_full[idx_ampla]
+        psd_ampla  = psd_full_uv2[idx_ampla]
+
+        if np.any(psd_ampla <= 0):
+            return None, "PSD contém valores <= 0"
+        if np.any(np.isnan(psd_ampla)) or np.any(np.isinf(psd_ampla)):
+            return None, "PSD contém NaN ou Inf"
+
+        fm = FOOOF(**fooof_config)
+        fm.fit(freq_ampla, psd_ampla)
+
+        r2 = fm.r_squared_
+        if r2 < R2_THRESHOLD:
+            return None, f"R²={r2:.4f} abaixo do threshold ({R2_THRESHOLD})"
+
+        ap_fit_ampla = (10 ** fm._ap_fit) if hasattr(fm, '_ap_fit') and fm._ap_fit is not None \
+                       else np.ones_like(psd_ampla)
+
+        comp_per_excesso_ampla = reconstruir_componente_periodica(fm, freq_ampla)
+        comp_per_ampla_uv2 = comp_per_excesso_ampla * ap_fit_ampla
+
+        idx_banda = (freq_ampla >= fmin_banda) & (freq_ampla <= fmax_banda)
+        if np.sum(idx_banda) < 5:
+            return None, f"poucos pontos na banda {nome_banda} ({np.sum(idx_banda)} pontos)"
+
+        freq_banda           = freq_ampla[idx_banda]
+        psd_banda_uv2        = psd_ampla[idx_banda]
+        ap_fit_banda         = ap_fit_ampla[idx_banda]
+        comp_per_banda_uv2   = comp_per_ampla_uv2[idx_banda]
+
+        full_fit_ampla  = ap_fit_ampla + comp_per_ampla_uv2
+        full_fit_banda  = ap_fit_banda  + comp_per_banda_uv2
+
+        offset   = fm.aperiodic_params_[0] if hasattr(fm, 'aperiodic_params_') and len(fm.aperiodic_params_) >= 1 else None
+        expoente = fm.aperiodic_params_[1] if hasattr(fm, 'aperiodic_params_') and len(fm.aperiodic_params_) >= 2 else None
+
+        from scipy.signal import find_peaks
+        picos_info = []
+        if hasattr(fm, 'peak_params_') and fm.peak_params_ is not None and len(fm.peak_params_) > 0:
+            for freq_pico_fooof, amp_pico, bw_pico in fm.peak_params_:
+                if not (fmin_banda <= freq_pico_fooof <= fmax_banda):
+                    continue
+                idx_aprox  = np.argmin(np.abs(freq_banda - freq_pico_fooof))
+                janela_hz  = max(bw_pico, 1.0)
+                idx_janela = (freq_banda >= freq_pico_fooof - janela_hz / 2) & \
+                             (freq_banda <= freq_pico_fooof + janela_hz / 2)
+
+                if np.sum(idx_janela) < 3:
+                    idx_pico_real = idx_aprox
+                else:
+                    periodica_janela = comp_per_banda_uv2[idx_janela]
+                    picos_locais, _  = find_peaks(periodica_janela, height=0)
+                    indices_janela   = np.where(idx_janela)[0]
+                    if len(picos_locais) > 0:
+                        idx_pico_real = indices_janela[picos_locais[np.argmax(periodica_janela[picos_locais])]]
+                    else:
+                        idx_pico_real = indices_janela[np.argmax(periodica_janela)]
+
+                freq_pico_visual = freq_banda[idx_pico_real]
+                psd_fit_pico     = comp_per_banda_uv2[idx_pico_real]
+
+                if abs(freq_pico_visual - freq_pico_fooof) > 2 * bw_pico:
+                    idx_pico_real    = idx_aprox
+                    freq_pico_visual = freq_banda[idx_aprox]
+                    psd_fit_pico     = comp_per_banda_uv2[idx_aprox]
+
+                picos_info.append({
+                    'frequencia':             freq_pico_visual,
+                    'frequencia_fooof':       freq_pico_fooof,
+                    'amplitude':              amp_pico,
+                    'largura':                bw_pico,
+                    'psd_fit':                psd_fit_pico,
+                    'densidade_original':     psd_banda_uv2[idx_pico_real],
+                    'densidade_fit':          psd_fit_pico,
+                    'densidade_aperiodic':    ap_fit_banda[idx_pico_real],
+                    'densidade_isolada':      psd_fit_pico,
+                    'potencia_fit':           psd_fit_pico,
+                    'indice_freq':            idx_pico_real,
+                    'diferenca_fooof_visual': abs(freq_pico_visual - freq_pico_fooof),
+                })
+
+        area_original  = np.trapezoid(psd_banda_uv2,       freq_banda)
+        area_aperiodic = np.trapezoid(ap_fit_banda,          freq_banda)
+        area_periodica = np.trapezoid(comp_per_banda_uv2,    freq_banda)
+
+        return {
+            'psd_media_original':      np.mean(psd_banda_uv2),
+            'desvio_padrao_original':  np.std(psd_banda_uv2),
+            'area_original':           area_original,
+
+            'psd_media_aperiodic':     np.mean(ap_fit_banda),
+            'desvio_padrao_aperiodic': np.std(ap_fit_banda),
+            'area_aperiodic':          area_aperiodic,
+
+            'psd_media_fit':           np.mean(comp_per_banda_uv2),
+            'desvio_padrao_fit':       np.std(comp_per_banda_uv2),
+            'area_fit':                area_periodica,
+
+            'picos':                   picos_info,
+            'r_squared':               fm.r_squared_,
+            'erro':                    fm.error_,
+            'expoente_aperiodico':     expoente,
+            'offset_aperiodico':       offset,
+
+            'potencia_total_area':     area_periodica,
+            'densidade_media':         np.mean(comp_per_banda_uv2),
+            'desvio_padrao':           np.std(comp_per_banda_uv2),
+            'area_psd':                area_periodica,
+            'potencia_total':          area_periodica,
+            'densidade_max':           np.max(comp_per_banda_uv2),
+            'potencia_media':          np.mean(comp_per_banda_uv2),
+            'potencia_max':            np.max(comp_per_banda_uv2),
+            'fooof_model':             fm,
+
+            'freq_banda':              freq_banda,
+            'psd_banda_micro':         psd_banda_uv2,
+            'psd_banda_linear':        psd_ampla[idx_banda],
+            'full_fit_linear':         full_fit_banda,
+            'ap_fit_linear':           ap_fit_banda,
+            'componente_periodica':    comp_per_banda_uv2,
+            'freq_ampla':              freq_ampla,
+            'psd_ampla_micro':         psd_ampla,
+            'full_fit_ampla':          full_fit_ampla,
+            'ap_fit_ampla':            ap_fit_ampla,
+            'componente_periodica_ampla': comp_per_ampla_uv2,
+        }, None
+
+    except Exception as e:
+        return None, f"exceção: {e}"
+
+
+# ============================================================
+# Médias e gráficos
+# ============================================================
+
+def calcular_media_fooof_para_grafico(lista_metricas):
+    metricas_validas = [m for m in lista_metricas if m is not None]
+    if not metricas_validas:
+        return None
+
+    freq_banda_ref = metricas_validas[0]['freq_banda']
+    n_freq         = len(freq_banda_ref)
+
+    todos_picos = []
+    psd_arrays  = []
+    fit_arrays  = []
+    ap_arrays   = []
+    per_arrays  = []
+
+    for m in metricas_validas:
+        arrays = [m['psd_banda_micro'], m['full_fit_linear'], m['ap_fit_linear'], m['componente_periodica']]
+        if any(np.any(np.isnan(a)) or np.any(np.isinf(a)) for a in arrays):
+            print("      Aviso: intervalo ignorado na média do gráfico (NaN/Inf)")
+            continue
+        if len(m['freq_banda']) == n_freq and np.allclose(m['freq_banda'], freq_banda_ref):
+            psd_arrays.append(m['psd_banda_micro'])
+            fit_arrays.append(m['full_fit_linear'])
+            ap_arrays.append(m['ap_fit_linear'])
+            per_arrays.append(m['componente_periodica'])
+            todos_picos.extend(m.get('picos', []))
+
+    if not psd_arrays:
+        return None
+
+    n_usadas = len(psd_arrays)
+
+    def _media_geo(arrays):
+        validos = [a for a in arrays if np.all(a > 0)]
+        if not validos:
+            return np.mean(np.stack(arrays, axis=0), axis=0)
+        log_stack = np.log10(np.stack(validos, axis=0))
+        return 10 ** np.mean(log_stack, axis=0)
+
+    psd_media = _media_geo(psd_arrays)
+    fit_media = _media_geo(fit_arrays)
+    ap_media  = _media_geo(ap_arrays)
+    per_media = np.mean(np.stack(per_arrays, axis=0), axis=0)
+
+    class FooofMedio:
+        def __init__(self):
+            self.r_squared_   = np.mean([m['r_squared'] for m in metricas_validas])
+            self.error_       = np.mean([m['erro']       for m in metricas_validas])
+            self.peak_params_ = []
+            if todos_picos:
+                grupos = []
+                for p in todos_picos:
+                    adicionado = False
+                    for g in grupos:
+                        if abs(p['frequencia'] - g[0]['frequencia']) <= 1.0:
+                            g.append(p); adicionado = True; break
+                    if not adicionado:
+                        grupos.append([p])
+                for g in grupos:
+                    self.peak_params_.append([
+                        np.mean([p['frequencia'] for p in g]),
+                        np.mean([p['amplitude']  for p in g]),
+                        np.mean([p['largura']    for p in g]),
+                    ])
+
+    fm_medio     = FooofMedio()
+    picos_medios = []
+    for freq_p, amp_p, larg_p in fm_medio.peak_params_:
+        idx_p = np.argmin(np.abs(freq_banda_ref - freq_p))
+        picos_medios.append({
+            'frequencia': freq_p, 'frequencia_fooof': freq_p,
+            'amplitude': amp_p,   'largura': larg_p,
+            'psd_fit': per_media[idx_p], 'densidade_fit': per_media[idx_p],
+            'indice_freq': idx_p,
+        })
+
+    return {
+        'freq_banda':                 freq_banda_ref,
+        'psd_banda_micro':            psd_media,
+        'full_fit_linear':            fit_media,
+        'ap_fit_linear':              ap_media,
+        'componente_periodica':       per_media,
+        'fooof_model':                fm_medio,
+        'picos':                      picos_medios,
+        'picos_brutos':               todos_picos,
+        'r_squared':                  fm_medio.r_squared_,
+        'erro':                       fm_medio.error_,
+        'n_intervalos':               n_usadas,
+        'num_picos_total_intervalos': len(todos_picos),
+        'metodo_media':               'geometrica_log',
+    }
+
+
+def criar_grafico_fooof_com_stats(resultado, nome_banda, nome_canal, prefixo_arquivo,
+                                  fmin, fmax, pasta_saida, condicao):
+    try:
+        freq_banda           = resultado['freq_banda']
+        psd_banda_micro      = resultado['psd_banda_micro']
+        full_fit_linear      = resultado['full_fit_linear']
+        ap_fit_linear        = resultado['ap_fit_linear']
+        componente_periodica = resultado.get('componente_periodica', full_fit_linear - ap_fit_linear)
+
+        plt.figure(figsize=(14, 8))
+        plt.style.use('default')
+
+        plt.plot(freq_banda, psd_banda_micro, color='#000000', linewidth=1.5, alpha=0.8, label='Espectro Original')
+        plt.plot(freq_banda, full_fit_linear, color='#e74c3c', linewidth=2,              label='Modelo Completo FOOOF')
+        plt.plot(freq_banda, ap_fit_linear,   color='#3498db', linewidth=2, linestyle='--', label='Componente Aperiódica')
+        plt.fill_between(freq_banda, ap_fit_linear, full_fit_linear, color='lightgreen', alpha=0.3, label='Componente Periódica (gaussianas)')
+
+        cond_nome = 'Olhos Abertos' if condicao == 'OA' else 'Olhos Fechados'
+        n_int_str = f" (Média geométrica de {resultado['n_intervalos']} intervalos)" if 'n_intervalos' in resultado else ""
+        plt.title(f"Banda {nome_banda.upper()} — Canal {nome_canal} — {cond_nome} — "
+                  f"{prefixo_arquivo}{n_int_str} [FOOOF {FOOOF_FMIN:.0f}-{FOOOF_FMAX:.0f} Hz]",
+                  fontsize=12, fontweight='bold')
+        plt.xlabel('Frequência (Hz)', fontsize=12, fontweight='bold')
+        plt.ylabel('Densidade Espectral de Potência (µV²/Hz)', fontsize=12, fontweight='bold')
+
+        handles = [
+            plt.Line2D([0],[0], color='#000000', linewidth=1.5,                label='Original Spectrum'),
+            plt.Line2D([0],[0], color='#e74c3c', linewidth=2,                 label='Full FOOOF Model'),
+            plt.Line2D([0],[0], color='#3498db', linewidth=2, linestyle='--', label='Aperiodic Component'),
+            plt.Line2D([0],[0], color='#2ecc71', linewidth=2,                 label='Periodic Component (Gaussians)'),
+        ]
+        legend = plt.legend(handles=handles, loc='center right', bbox_to_anchor=(0.99, 0.5),
+                            fontsize=9, frameon=True, fancybox=True, shadow=True, framealpha=0.9)
+        legend.get_frame().set_facecolor('white')
+        legend.get_frame().set_edgecolor('black')
+        plt.grid(True, linestyle='--', linewidth=0.5, alpha=0.3, color='gray')
+
+        ax           = plt.gca()
+        psd_med_per  = np.mean(componente_periodica)
+        area_per     = np.trapezoid(componente_periodica, freq_banda)
+        picos_brutos = resultado.get('picos_brutos', resultado.get('picos', []))
+        n_picos      = len(picos_brutos)
+
+        stats_text = (
+            f"Estatísticas {nome_banda.upper()} ({fmin:.1f}-{fmax} Hz):\n"
+            f"[FOOOF fit: {FOOOF_FMIN:.0f}-{FOOOF_FMAX:.0f} Hz]\n"
+            f"[Média: geométrica (log-espaço)]\n\n"
+            f"ORIGINAL (potência padrão EEG):\n"
+            f"PSD Média: {np.mean(psd_banda_micro):.4f} µV²/Hz\n"
+            f"Área: {np.trapezoid(psd_banda_micro, freq_banda):.4f} µV²\n\n"
+            f"APERIÓDICA:\n"
+            f"PSD Média: {np.mean(ap_fit_linear):.4f} µV²/Hz\n"
+            f"Área: {np.trapezoid(ap_fit_linear, freq_banda):.4f} µV²\n\n"
+            f"PERIÓDICA (gaussianas FOOOF):\n"
+            f"PSD Média: {psd_med_per:.4f} µV²/Hz\n"
+            f"Área: {area_per:.4f} µV²\n"
+            f"  ⚠ Não equivale à potência total da banda\n\n"
+        )
+        if picos_brutos:
+            stats_text += (f"Picos ({n_picos}):\n"
+                           f"Freq. Média: {np.mean([p['frequencia'] for p in picos_brutos]):.2f} Hz\n"
+                           f"PSD Média: {np.mean([p['psd_fit'] for p in picos_brutos]):.4f} µV²/Hz")
+        else:
+            stats_text += "Picos: Nenhum detectado"
+
+        plt.text(0.98, 0.98, stats_text, transform=ax.transAxes, fontsize=8,
+                 verticalalignment='top', horizontalalignment='right',
+                 bbox=dict(boxstyle='round,pad=0.5', facecolor='white', edgecolor='black', alpha=0.9))
+        plt.text(0.02, 0.02,
+                 f"FOOOF ({FOOOF_FMIN:.0f}-{FOOOF_FMAX:.0f} Hz):\nR²: {resultado.get('r_squared',0):.4f}\nPicos: {n_picos}",
+                 transform=ax.transAxes, fontsize=9, verticalalignment='bottom', horizontalalignment='left',
+                 bbox=dict(boxstyle='round,pad=0.4', facecolor='lightblue', edgecolor='black', alpha=0.9))
+
+        plt.tight_layout()
+        sufixo    = "_MEDIA" if 'n_intervalos' in resultado else ""
+        nome_graf = f"{prefixo_arquivo}_{nome_canal}_{nome_banda}_{condicao}_FOOOF{sufixo}.png"
+        plt.savefig(os.path.join(pasta_saida, nome_graf), dpi=300, bbox_inches='tight',
+                    facecolor='white', edgecolor='none')
+        plt.close()
+        print(f"        Gráfico salvo: {nome_graf}")
+
+    except Exception as e:
+        print(f"        Erro ao criar gráfico: {e}")
+        plt.close()
+
+
+# ============================================================
+# MODIFICAÇÃO 1: calcular_media_metricas agora inclui
+#   - desvio padrão da frequência média dos picos
+#   - desvio padrão do PSD dos picos
+#   - desvio padrão do PSD periódico
+# Retorna também as listas brutas para uso posterior nas médias regionais
+# ============================================================
+
+def calcular_media_metricas(lista_resultados):
+    validos = [r for r in lista_resultados if r is not None]
+    if not validos:
+        return None
+
+    n      = len(validos)
+    campos = ['psd_media_original', 'area_original', 'psd_media_aperiodic',
+              'area_aperiodic', 'psd_media_fit', 'area_fit', 'r_squared', 'erro']
+    soma   = {c: 0   for c in campos}
+    listas = {c: []  for c in campos}
+    todos_picos = []
+
+    for r in validos:
+        for c in campos:
+            soma[c] += r[c]
+            listas[c].append(r[c])
+        todos_picos.extend(r.get('picos', []))
+
+    media = {
+        'num_intervalos_validos': n,
+        **{c: soma[c] / n              for c in campos},
+        **{f'{c}_std': np.std(listas[c]) for c in campos},
+    }
+
+    # ── PICOS: frequência e PSD com desvio padrão ──────────────────────────
+    if todos_picos:
+        freqs_picos = [p['frequencia'] for p in todos_picos]
+        psd_picos   = [p['psd_fit']    for p in todos_picos]
+        media.update({
+            'num_picos_total':            len(todos_picos),
+            # Frequência dos picos
+            'frequencia_picos_media':     np.mean(freqs_picos),
+            'frequencia_picos_std':       np.std(freqs_picos),   # ← NOVO: DP da freq dos picos
+            'frequencia_picos_min':       np.min(freqs_picos),
+            'frequencia_picos_max':       np.max(freqs_picos),
+            # PSD dos picos
+            'psd_fit_picos_media':        np.mean(psd_picos),
+            'psd_fit_picos_std':          np.std(psd_picos),     # ← NOVO: DP do PSD dos picos
+            # PSD periódico (já tem média via campo psd_media_fit, aqui o DP extra)
+            'psd_periodica_media':        media['psd_media_fit'],
+            'psd_periodica_std':          media['psd_media_fit_std'],
+        })
+    else:
+        media.update({
+            'num_picos_total':        0,
+            'frequencia_picos_media': None,
+            'frequencia_picos_std':   None,
+            'frequencia_picos_min':   None,
+            'frequencia_picos_max':   None,
+            'psd_fit_picos_media':    None,
+            'psd_fit_picos_std':      None,
+            'psd_periodica_media':    media['psd_media_fit'],
+            'psd_periodica_std':      media['psd_media_fit_std'],
+        })
+
+    # Guarda lista de picos brutos para uso nas médias regionais
+    media['_picos_brutos'] = todos_picos
+    return media
+
+
+# ============================================================
+# MODIFICAÇÃO 2 e 3: médias por região e região específica
+#
+# acumula_dados_regionais() — chamado a cada canal processado
+# calcular_e_salvar_medias_regionais() — chamado ao final
+# ============================================================
+
+def _prefixo_regiao_ampla(nome_canal):
+    """Retorna a chave da região ampla à qual o canal pertence, ou None."""
+    ch_up = nome_canal.upper()
+    for regiao, prefixo in REGIOES_AMPLAS_PREFIXOS.items():
+        if ch_up.startswith(prefixo.upper()):
+            return regiao
+    return None
+
+
+def _regiao_especifica(nome_canal):
+    """Retorna a chave da região específica à qual o canal pertence, ou None."""
+    ch_up = nome_canal.upper()
+    for regiao, lista in REGIOES_ESPECIFICAS.items():
+        if ch_up in [c.upper() for c in lista]:
+            return regiao
+    return None
+
+
+def acumula_dados_regionais(banco_regional, nome_canal, nome_banda, condicao, media_metricas):
+    """
+    Acumula médias de canais no banco regional para posterior cálculo.
+
+    banco_regional: dict estruturado como
+      banco_regional[tipo_regiao][nome_regiao][banda][condicao] = lista de dicts
+    onde cada dict tem as métricas do canal (média dos intervalos).
+    """
+    if media_metricas is None:
+        return
+
+    regiao_ampla   = _prefixo_regiao_ampla(nome_canal)
+    regiao_espec   = _regiao_especifica(nome_canal)
+
+    # Prepara entrada com as métricas relevantes deste canal
+    entrada = {
+        'canal':               nome_canal,
+        'psd_periodica_media': media_metricas.get('psd_media_fit'),
+        'psd_periodica_std':   media_metricas.get('psd_media_fit_std'),
+        'psd_pico_media':      media_metricas.get('psd_fit_picos_media'),
+        'psd_pico_std':        media_metricas.get('psd_fit_picos_std'),
+        'freq_pico_media':     media_metricas.get('frequencia_picos_media'),
+        'freq_pico_std':       media_metricas.get('frequencia_picos_std'),
+        'num_picos':           media_metricas.get('num_picos_total', 0),
+        'num_intervalos':      media_metricas.get('num_intervalos_validos', 0),
+        '_picos_brutos':       media_metricas.get('_picos_brutos', []),
+    }
+
+    chave_cond = condicao   # 'OA' ou 'OF'
+
+    if regiao_ampla:
+        (banco_regional
+            .setdefault('ampla', {})
+            .setdefault(regiao_ampla, {})
+            .setdefault(nome_banda, {})
+            .setdefault(chave_cond, [])
+            .append(entrada))
+
+    if regiao_espec:
+        (banco_regional
+            .setdefault('especifica', {})
+            .setdefault(regiao_espec, {})
+            .setdefault(nome_banda, {})
+            .setdefault(chave_cond, [])
+            .append(entrada))
+
+
+def _resumo_regional(entradas):
+    """
+    Dado uma lista de entradas (dicts) de canais de uma mesma região/banda/condição,
+    calcula médias e DPs das métricas principais.
+    Retorna dict com o resumo ou None se não houver dados.
+    """
+    if not entradas:
+        return None
+
+    canais = [e['canal'] for e in entradas]
+
+    # PSD Periódica: média dos valores médios de cada canal
+    vals_psd_per = [e['psd_periodica_media'] for e in entradas if e['psd_periodica_media'] is not None]
+
+    # PSD do Pico: média dos valores médios de cada canal
+    vals_psd_pico = [e['psd_pico_media'] for e in entradas if e['psd_pico_media'] is not None]
+
+    # Frequência do Pico: coleta TODOS os picos brutos de todos os canais da região
+    # para calcular média e DP sobre os picos individuais (não sobre médias de canais)
+    todos_picos_brutos = []
+    for e in entradas:
+        todos_picos_brutos.extend(e.get('_picos_brutos', []))
+
+    freqs_picos_brutos = [p['frequencia'] for p in todos_picos_brutos]
+    psd_picos_brutos   = [p['psd_fit']    for p in todos_picos_brutos]
+
+    resumo = {
+        'canais':          canais,
+        'n_canais':        len(canais),
+        'n_picos_total':   len(todos_picos_brutos),
+
+        # PSD Periódica (média entre canais da região)
+        'psd_periodica_media': np.mean(vals_psd_per)  if vals_psd_per  else None,
+        'psd_periodica_std':   np.std(vals_psd_per)   if len(vals_psd_per) > 1  else (0.0 if vals_psd_per else None),
+
+        # PSD do Pico (média entre canais da região)
+        'psd_pico_media': np.mean(vals_psd_pico) if vals_psd_pico else None,
+        'psd_pico_std':   np.std(vals_psd_pico)  if len(vals_psd_pico) > 1 else (0.0 if vals_psd_pico else None),
+
+        # Frequência dos Picos — calculada sobre TODOS os picos brutos da região
+        'freq_pico_media': np.mean(freqs_picos_brutos) if freqs_picos_brutos else None,
+        'freq_pico_std':   np.std(freqs_picos_brutos)  if len(freqs_picos_brutos) > 1 else (0.0 if freqs_picos_brutos else None),
+        'freq_pico_min':   np.min(freqs_picos_brutos)  if freqs_picos_brutos else None,
+        'freq_pico_max':   np.max(freqs_picos_brutos)  if freqs_picos_brutos else None,
+
+        # PSD picos brutos (para conferência)
+        'psd_pico_bruto_media': np.mean(psd_picos_brutos) if psd_picos_brutos else None,
+        'psd_pico_bruto_std':   np.std(psd_picos_brutos)  if len(psd_picos_brutos) > 1 else (0.0 if psd_picos_brutos else None),
+    }
+    return resumo
+
+
+def calcular_e_salvar_medias_regionais(banco_regional, prefixo, pasta_saida):
+    """
+    Processa o banco_regional acumulado e salva um arquivo de texto
+    com as médias e DPs por região (ampla e específica), banda e condição.
+    """
+    caminho = os.path.join(pasta_saida, f"{prefixo}_MEDIAS_REGIONAIS.txt")
+
+    def formatar_val(v, decimais=5):
+        return f"{v:.{decimais}f}" if v is not None else "N/A"
+
+    def bloco_regiao(nome_regiao, entradas_por_banda_cond, tipo_label):
+        linhas = [f"\n  {'─'*60}",
+                  f"  {tipo_label}: {nome_regiao}",
+                  f"  {'─'*60}"]
+
+        for banda in sorted(entradas_por_banda_cond.keys()):
+            linhas.append(f"\n    Banda: {banda.upper()}")
+            for cond in ['OA', 'OF']:
+                cond_nome = "Olhos Abertos" if cond == "OA" else "Olhos Fechados"
+                entradas  = entradas_por_banda_cond[banda].get(cond, [])
+                res       = _resumo_regional(entradas)
+
+                linhas.append(f"\n      {cond_nome} ({cond}):")
+                if res is None or res['n_canais'] == 0:
+                    linhas.append("        Sem dados para esta região/condição.")
+                    continue
+
+                linhas.append(f"        Canais incluídos ({res['n_canais']}): {', '.join(res['canais'])}")
+                linhas.append(f"        Total de picos brutos: {res['n_picos_total']}")
+                linhas.append("")
+                linhas.append(f"        PSD Periódica (µV²/Hz):")
+                linhas.append(f"          Média: {formatar_val(res['psd_periodica_media'])}  ±  {formatar_val(res['psd_periodica_std'])} (DP)")
+                linhas.append("")
+                linhas.append(f"        PSD do Pico (µV²/Hz):")
+                linhas.append(f"          Média (por canal): {formatar_val(res['psd_pico_media'])}  ±  {formatar_val(res['psd_pico_std'])} (DP)")
+                linhas.append(f"          Média (picos brutos): {formatar_val(res['psd_pico_bruto_media'])}  ±  {formatar_val(res['psd_pico_bruto_std'])} (DP)")
+                linhas.append("")
+                linhas.append(f"        Frequência dos Picos (Hz)  [calculada sobre todos os picos brutos da região]:")
+                linhas.append(f"          Média: {formatar_val(res['freq_pico_media'], 3)}  ±  {formatar_val(res['freq_pico_std'], 3)} (DP)")
+                linhas.append(f"          Mín: {formatar_val(res['freq_pico_min'], 3)}   Máx: {formatar_val(res['freq_pico_max'], 3)}")
+
+        return linhas
+
+    with open(caminho, 'w', encoding='utf-8') as f:
+        f.write(f"MÉDIAS REGIONAIS — {prefixo}\n")
+        f.write(f"R² threshold: {R2_THRESHOLD}  |  FOOOF fit: {FOOOF_FMIN:.0f}-{FOOOF_FMAX:.0f} Hz\n")
+        f.write(f"Componente periódica: gaussianas FOOOF (Donoghue et al., 2020)\n")
+        f.write("=" * 80 + "\n")
+        f.write("\nNOTAS METODOLÓGICAS:\n")
+        f.write("  • PSD Periódica: média (e DP) calculada sobre as médias dos canais da região.\n")
+        f.write("  • PSD do Pico (por canal): média/DP das médias de pico de cada canal.\n")
+        f.write("  • PSD do Pico (picos brutos): média/DP de todos os picos individuais da região.\n")
+        f.write("  • Freq. dos Picos: média/DP calculada sobre TODOS os picos brutos da região\n")
+        f.write("    (não sobre médias de canal), capturando variabilidade real dos picos.\n")
+        f.write("=" * 80 + "\n")
+
+        # ── Regiões Amplas ───────────────────────────────────────────────────
+        f.write("\n\n╔══════════════════════════════════════════════════════════════╗\n")
+        f.write(  "║  1. REGIÕES AMPLAS                                           ║\n")
+        f.write(  "║  (todos os canais com o mesmo prefixo de letra)              ║\n")
+        f.write(  "╚══════════════════════════════════════════════════════════════╝\n")
+        f.write(  "  Frontal: todos F* | Parietal: todos P* | Occipital: todos O* | Temporal: todos T*\n")
+
+        amplas = banco_regional.get('ampla', {})
+        for nome_regiao in ['Frontal', 'Parietal', 'Occipital', 'Temporal']:
+            dados_regiao = amplas.get(nome_regiao, {})
+            linhas = bloco_regiao(nome_regiao, dados_regiao, "REGIÃO AMPLA")
+            f.write('\n'.join(linhas) + '\n')
+
+        # ── Regiões Específicas ──────────────────────────────────────────────
+        f.write("\n\n╔══════════════════════════════════════════════════════════════╗\n")
+        f.write(  "║  2. REGIÕES ESPECÍFICAS                                      ║\n")
+        f.write(  "╚══════════════════════════════════════════════════════════════╝\n")
+        labels_espec = {
+            'F_especifico': 'F3, F4, Fz',
+            'P_especifico': 'P3, P4, Pz',
+            'O_especifico': 'O1, O2, Oz',
+        }
+        especificas = banco_regional.get('especifica', {})
+        for nome_regiao, canais_label in labels_espec.items():
+            dados_regiao = especificas.get(nome_regiao, {})
+            linhas = bloco_regiao(f"{nome_regiao.replace('_especifico','')} específico ({canais_label})",
+                                  dados_regiao, "REGIÃO ESPECÍFICA")
+            f.write('\n'.join(linhas) + '\n')
+
+        f.write("\n" + "=" * 80 + "\n")
+        f.write("FIM DO RELATÓRIO DE MÉDIAS REGIONAIS\n")
+
+    print(f"\n  🗺️  Médias regionais salvas: {prefixo}_MEDIAS_REGIONAIS.txt")
+    return caminho
+
+
+# ============================================================
+# Funções auxiliares de saída
+# ============================================================
+
+def calcular_media_metricas_graf(lista_resultados):
+    """Alias mantido para compatibilidade — chama calcular_media_metricas."""
+    return calcular_media_metricas(lista_resultados)
+
+
+def salvar_resultados_completo(saida, arquivo, prefixo, nome_canal, nome_banda,
+                               intervalos_oa, intervalos_of,
+                               resultados_oa, resultados_of,
+                               falhas_oa, falhas_of,
+                               media_oa, media_of):
+    txt_path = os.path.join(saida, f"{prefixo}_{nome_canal}_{nome_banda}_COMPLETO.txt")
+
+    def _fmt(v, d=5):
+        return f"{v:.{d}f}" if v is not None else "N/A"
+
+    def bloco_media(titulo, media):
+        if not media:
+            return f"{titulo}: sem dados válidos\n"
+        s  = f"{titulo} (n={media['num_intervalos_validos']}/10):\n"
+        s += f"  ORIGINAL (potência padrão EEG):\n"
+        s += f"    PSD={_fmt(media['psd_media_original'])}±{_fmt(media.get('psd_media_original_std',0))}  "
+        s += f"Área={_fmt(media['area_original'])}±{_fmt(media.get('area_original_std',0))} µV²\n"
+        s += f"  APERIÓDICA:\n"
+        s += f"    PSD={_fmt(media['psd_media_aperiodic'])}±{_fmt(media.get('psd_media_aperiodic_std',0))}  "
+        s += f"Área={_fmt(media['area_aperiodic'])}±{_fmt(media.get('area_aperiodic_std',0))} µV²\n"
+        s += f"  PERIÓDICA (gaussianas FOOOF) [⚠ não é potência total]:\n"
+        s += f"    PSD={_fmt(media['psd_media_fit'])}±{_fmt(media.get('psd_media_fit_std',0))}  "
+        s += f"Área={_fmt(media['area_fit'])}±{_fmt(media.get('area_fit_std',0))} µV²\n"
+        s += f"  R² médio: {_fmt(media['r_squared'],4)}±{_fmt(media.get('r_squared_std',0),4)}\n"
+
+        # ── PICOS com DP (MODIFICAÇÃO 1) ────────────────────────────────────
+        if media.get('num_picos_total', 0) > 0:
+            freq_m   = media.get('frequencia_picos_media')
+            freq_sd  = media.get('frequencia_picos_std')
+            psd_m    = media.get('psd_fit_picos_media')
+            psd_sd   = media.get('psd_fit_picos_std')
+            freq_rng = (f"[{_fmt(media['frequencia_picos_min'],2)}–{_fmt(media['frequencia_picos_max'],2)} Hz]"
+                        if media.get('frequencia_picos_min') is not None else "")
+            s += (f"  PICOS ({media['num_picos_total']} total):\n"
+                  f"    Freq. média: {_fmt(freq_m,3)} ± {_fmt(freq_sd,3)} Hz  {freq_rng}\n"
+                  f"    PSD Pico média: {_fmt(psd_m)} ± {_fmt(psd_sd)} µV²/Hz\n")
+        else:
+            s += "  PICOS: Nenhum detectado\n"
+        return s
+
+    with open(txt_path, 'w', encoding='utf-8') as f:
+        f.write(f"ANÁLISE FOOOF COMPLETA — {prefixo}\n")
+        f.write(f"Arquivo: {arquivo}\nCanal: {nome_canal}\nBanda: {nome_banda.upper()}\n")
+        f.write(f"FOOOF fit: {FOOOF_FMIN:.0f}-{FOOOF_FMAX:.0f} Hz  |  R² threshold: {R2_THRESHOLD}\n")
+        f.write(f"Componente periódica: reconstruída via gaussianas (Donoghue et al., 2020)\n")
+        f.write(f"Média entre intervalos: geométrica (log-espaço)\n{'='*80}\n\n")
+        f.write("1. RESUMO — MÉDIAS DOS INTERVALOS:\n" + "-"*50 + "\n")
+        f.write(bloco_media("OLHOS ABERTOS",  media_oa))
+        f.write(bloco_media("OLHOS FECHADOS", media_of))
+        f.write("\n" + "="*80 + "\n2. DETALHES POR INTERVALO:\n\n")
+
+        for titulo, intervalos, resultados, falhas in [
+            ("2.1 OLHOS ABERTOS",  intervalos_oa, resultados_oa, falhas_oa),
+            ("2.2 OLHOS FECHADOS", intervalos_of, resultados_of, falhas_of),
+        ]:
+            f.write(f"{titulo}:\n" + "-"*50 + "\n")
+            for i, (inicio, res, falha) in enumerate(zip(intervalos, resultados, falhas)):
+                f.write(f"Intervalo {i+1}: {inicio}s-{inicio+6}s\n")
+                if res:
+                    # Picos com DP por intervalo (MODIFICAÇÃO 1)
+                    picos_res = res.get('picos', [])
+                    n_p = len(picos_res)
+                    f.write(f"  ✔ VÁLIDO  R²={res['r_squared']:.4f}  Erro={res['erro']:.4f}  Picos={n_p}\n")
+                    f.write(f"  ORIGINAL:     PSD={res['psd_media_original']:.5f}  Área={res['area_original']:.5f} µV²\n")
+                    f.write(f"  APERIÓDICA:   PSD={res['psd_media_aperiodic']:.5f}  Área={res['area_aperiodic']:.5f} µV²\n")
+                    f.write(f"  PERIÓDICA:    PSD={res['psd_media_fit']:.5f}  Área={res['area_fit']:.5f} µV²\n")
+                    for j, p in enumerate(picos_res):
+                        f.write(f"    Pico {j+1}: {p['frequencia']:.3f}Hz  PSD={p['psd_fit']:.5f} µV²/Hz\n")
+                else:
+                    f.write(f"  ✘ DESCARTADO — motivo: {falha}\n")
+                f.write("\n")
+        f.write("="*80)
+
+
+def classificar_r2_bins(lista_resultados):
+    bins = {'75-80': 0, '80-85': 0, '85-90': 0, '90-95': 0, '95-100': 0}
+    for r in lista_resultados:
+        if r is None: continue
+        r2 = r.get('r_squared', 0)
+        if   r2 < R2_THRESHOLD: continue
+        elif r2 < 0.80: bins['75-80']  += 1
+        elif r2 < 0.85: bins['80-85']  += 1
+        elif r2 < 0.90: bins['85-90']  += 1
+        elif r2 < 0.95: bins['90-95']  += 1
+        else:           bins['95-100'] += 1
+    return bins
+
+
+def contar_validos(lista_resultados):
+    validos = sum(1 for r in lista_resultados if r is not None and r.get('r_squared', 0) >= R2_THRESHOLD)
+    total   = sum(1 for r in lista_resultados if r is not None)
+    return validos, total
+
+
+def salvar_r2_por_canal(prefixo, nome_canal, r2_dict, pasta_saida):
+    caminho = os.path.join(pasta_saida, f"{prefixo}_{nome_canal}_R2_RESUMO.txt")
+    with open(caminho, 'w', encoding='utf-8') as f:
+        f.write(f"PACIENTE/ARQUIVO: {prefixo}\nCANAL: {nome_canal}\n"
+                f"R² threshold: {R2_THRESHOLD}  |  FOOOF fit: {FOOOF_FMIN:.0f}-{FOOOF_FMAX:.0f} Hz\n{'='*60}\n\n")
+        for banda in r2_dict:
+            f.write(f"BANDA: {banda.upper()}\n" + "-"*40 + "\n")
+            for cond in ['OA', 'OF']:
+                f.write(f"{cond}:\n")
+                for faixa, v in r2_dict[banda][cond].items():
+                    f.write(f"  {faixa}: {v}\n")
+            f.write("\n")
+    print(f"      ✔ R² salvo: {prefixo}_{nome_canal}_R2_RESUMO.txt")
+
+
+# ============================================================
+# Diagnóstico consolidado de falhas
+# ============================================================
+
+def salvar_diagnostico_falhas(prefixo, todas_falhas, pasta_saida):
+    caminho = os.path.join(pasta_saida, f"{prefixo}_DIAGNOSTICO_FALHAS.txt")
+
+    contador_motivos = defaultdict(int)
+    for canal in todas_falhas:
+        for banda in todas_falhas[canal]:
+            for cond in todas_falhas[canal][banda]:
+                for _, motivo in todas_falhas[canal][banda][cond]:
+                    if motivo:
+                        if motivo.startswith("R²="):
+                            r2_val = float(motivo.split("=")[1].split(" ")[0])
+                            if r2_val < 0.50:               contador_motivos["R² < 0.50 (fit muito ruim)"] += 1
+                            elif r2_val < 0.65:             contador_motivos["R² 0.50–0.65 (fit ruim)"]    += 1
+                            elif r2_val < R2_THRESHOLD:     contador_motivos[f"R² 0.65–{R2_THRESHOLD} (abaixo do threshold)"] += 1
+                        else:
+                            contador_motivos[motivo] += 1
+
+    with open(caminho, 'w', encoding='utf-8') as f:
+        f.write(f"DIAGNÓSTICO DE FALHAS — {prefixo}\n")
+        f.write(f"R² threshold usado: {R2_THRESHOLD}  |  Mínimo de intervalos válidos: {MIN_INTERVALOS_VALIDOS}\n")
+        f.write("="*80 + "\n\n")
+
+        f.write("1. RESUMO GERAL DE MOTIVOS DE DESCARTE:\n" + "-"*50 + "\n")
+        if contador_motivos:
+            total_falhas = sum(contador_motivos.values())
+            for motivo, count in sorted(contador_motivos.items(), key=lambda x: -x[1]):
+                f.write(f"  {count:4d}x  ({100*count/total_falhas:.1f}%)  →  {motivo}\n")
+        else:
+            f.write("  Nenhuma falha registrada.\n")
+        f.write("\n")
+
+        f.write("2. CANAIS/BANDAS COM MENOS DE "
+                f"{MIN_INTERVALOS_VALIDOS} INTERVALOS VÁLIDOS:\n" + "-"*50 + "\n")
+        encontrou = False
+        for canal in sorted(todas_falhas):
+            for banda in sorted(todas_falhas[canal]):
+                for cond in ['OA', 'OF']:
+                    falhas_cond = todas_falhas[canal][banda].get(cond, [])
+                    n_validos   = sum(1 for _, m in falhas_cond if m is None)
+                    if n_validos < MIN_INTERVALOS_VALIDOS:
+                        encontrou = True
+                        cond_nome = "Olhos Abertos" if cond == "OA" else "Olhos Fechados"
+                        motivos_cond = [m for _, m in falhas_cond if m]
+                        resumo_motivos = {}
+                        for m in motivos_cond:
+                            chave_m = m.split(" abaixo")[0].split("=")[0] if "R²" in m else m[:40]
+                            resumo_motivos[chave_m] = resumo_motivos.get(chave_m, 0) + 1
+                        resumo_str = "  |  ".join(f"{k}: {v}x" for k,v in resumo_motivos.items())
+                        f.write(f"  {canal} | {banda.upper()} | {cond_nome}: "
+                                f"{n_validos}/10 válidos — {resumo_str}\n")
+        if not encontrou:
+            f.write("  Todos os canais/bandas têm intervalos suficientes.\n")
+
+        f.write("\n" + "="*80 + "\n")
+        f.write("3. DETALHE COMPLETO POR CANAL:\n\n")
+        for canal in sorted(todas_falhas):
+            f.write(f"  CANAL: {canal}\n")
+            for banda in sorted(todas_falhas[canal]):
+                for cond in ['OA', 'OF']:
+                    falhas_cond = todas_falhas[canal][banda].get(cond, [])
+                    if not falhas_cond:
+                        continue
+                    cond_nome = "OA" if cond == "OA" else "OF"
+                    n_val = sum(1 for _, m in falhas_cond if m is None)
+                    f.write(f"    {banda.upper()} {cond_nome} ({n_val}/10 válidos):\n")
+                    for inicio, motivo in falhas_cond:
+                        status = "✔" if motivo is None else f"✘ {motivo}"
+                        f.write(f"      {inicio}s: {status}\n")
+            f.write("\n")
+
+    print(f"\n  📋 Diagnóstico salvo: {prefixo}_DIAGNOSTICO_FALHAS.txt")
+    print(f"     Motivos principais:")
+    for motivo, count in sorted(contador_motivos.items(), key=lambda x: -x[1])[:5]:
+        print(f"       {count}x → {motivo}")
+
+
+# ============================================================
+# PROCESSAMENTO PRINCIPAL
+# ============================================================
+
+def processar_paciente(arquivo_set, intervalos_pacientes, saida):
+    arquivo = os.path.basename(arquivo_set)
+    prefixo = extrair_prefixo(arquivo)
+
+    intervalos_paciente = intervalos_pacientes.get(prefixo)
+    if not intervalos_paciente:
+        print(f"\n❌ Prefixo '{prefixo}' não encontrado na planilha.")
+        print(f"   Prefixos disponíveis: {list(intervalos_pacientes.keys())}")
+        return []
+
+    print(f"\n✔ Arquivo  : {arquivo}")
+    print(f"  Prefixo  : {prefixo}")
+    print(f"  Planilha : '{intervalos_paciente['nome_original']}'")
+    print(f"  R² threshold: {R2_THRESHOLD}  |  Mínimo intervalos válidos: {MIN_INTERVALOS_VALIDOS}")
+
+    resumo_validos = []
+    todas_falhas   = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
+
+    # ── Banco regional para acúmulo entre canais (MODIFICAÇÃO 2 e 3) ────────
+    banco_regional = {}
+
+    try:
+        raw = mne.io.read_raw_eeglab(arquivo_set, preload=True)
+
+        ja_em_uv = detectar_unidade_canal(raw)
+        dados_completos = raw.get_data()
+        if not ja_em_uv:
+            dados_completos = dados_completos * 1e6
+            print("  [Unidade] Dados convertidos: V → µV (×1e6)")
+        else:
+            print("  [Unidade] Dados já em µV — sem conversão")
+
+        srate         = int(raw.info['sfreq'])
+        canais        = raw.info['ch_names']
+        duracao_total = dados_completos.shape[1] / srate
+
+        print(f"  Duração: {duracao_total:.2f}s | Canais: {len(canais)} | Taxa: {srate}Hz")
+
+        for i, nome_canal in enumerate(canais):
+            r2_acumulado_canal = {}
+            print(f"  Canal: {nome_canal}")
+
+            if np.all(dados_completos[i, :] == 0):
+                print("    Canal zerado — pulando")
+                continue
+
+            for nome_banda, (fmin, fmax) in bandas.items():
+                resultados_oa, falhas_oa = [], []
+                resultados_of, falhas_of = [], []
+
+                for inicio in intervalos_paciente['olhos_abertos']:
+                    if inicio + DURACAO_INTERVALO <= duracao_total:
+                        seg = extrair_segmento_temporal(dados_completos, srate, inicio, DURACAO_INTERVALO)
+                        res, motivo = calcular_metricas_fooof_segmento(seg[i, :], srate, nome_banda, fmin, fmax)
+                        resultados_oa.append(res)
+                        falhas_oa.append((inicio, motivo))
+                        todas_falhas[nome_canal][nome_banda]['OA'].append((inicio, motivo))
+                    else:
+                        resultados_oa.append(None)
+                        falhas_oa.append((inicio, f"intervalo {inicio}s excede duração do arquivo"))
+                        todas_falhas[nome_canal][nome_banda]['OA'].append((inicio, f"excede duração"))
+
+                for inicio in intervalos_paciente['olhos_fechados']:
+                    if inicio + DURACAO_INTERVALO <= duracao_total:
+                        seg = extrair_segmento_temporal(dados_completos, srate, inicio, DURACAO_INTERVALO)
+                        res, motivo = calcular_metricas_fooof_segmento(seg[i, :], srate, nome_banda, fmin, fmax)
+                        resultados_of.append(res)
+                        falhas_of.append((inicio, motivo))
+                        todas_falhas[nome_canal][nome_banda]['OF'].append((inicio, motivo))
+                    else:
+                        resultados_of.append(None)
+                        falhas_of.append((inicio, f"excede duração"))
+                        todas_falhas[nome_canal][nome_banda]['OF'].append((inicio, f"excede duração"))
+
+                media_oa = calcular_media_metricas(resultados_oa)
+                media_of = calcular_media_metricas(resultados_of)
+
+                validos_oa, total_oa = contar_validos(resultados_oa)
+                validos_of, total_of = contar_validos(resultados_of)
+
+                flag_oa = " ⚠ ABAIXO DO MÍNIMO" if validos_oa < MIN_INTERVALOS_VALIDOS else ""
+                flag_of = " ⚠ ABAIXO DO MÍNIMO" if validos_of < MIN_INTERVALOS_VALIDOS else ""
+                print(f"    {nome_banda.upper()}: OA={validos_oa}/{total_oa}{flag_oa}  OF={validos_of}/{total_of}{flag_of}")
+
+                resumo_validos += [
+                    {'paciente': prefixo, 'canal': nome_canal, 'banda': nome_banda,
+                     'condicao': 'OA', 'validos': validos_oa, 'total': total_oa,
+                     'abaixo_minimo': validos_oa < MIN_INTERVALOS_VALIDOS},
+                    {'paciente': prefixo, 'canal': nome_canal, 'banda': nome_banda,
+                     'condicao': 'OF', 'validos': validos_of, 'total': total_of,
+                     'abaixo_minimo': validos_of < MIN_INTERVALOS_VALIDOS},
+                ]
+
+                r2_acumulado_canal[nome_banda] = {
+                    'OA': classificar_r2_bins(resultados_oa),
+                    'OF': classificar_r2_bins(resultados_of),
+                }
+
+                # ── Acumula no banco regional (MODIFICAÇÃO 2 e 3) ────────────
+                acumula_dados_regionais(banco_regional, nome_canal, nome_banda, 'OA', media_oa)
+                acumula_dados_regionais(banco_regional, nome_canal, nome_banda, 'OF', media_of)
+
+                salvar_resultados_completo(
+                    saida, arquivo, prefixo, nome_canal, nome_banda,
+                    intervalos_paciente['olhos_abertos'],
+                    intervalos_paciente['olhos_fechados'],
+                    resultados_oa, resultados_of,
+                    falhas_oa, falhas_of,
+                    media_oa, media_of
+                )
+                salvar_r2_por_canal(prefixo, nome_canal, r2_acumulado_canal, saida)
+
+                for condicao, resultados, media in [('OA', resultados_oa, media_oa), ('OF', resultados_of, media_of)]:
+                    if media is not None and media['num_intervalos_validos'] >= MIN_INTERVALOS_VALIDOS:
+                        dados_graf = calcular_media_fooof_para_grafico(resultados)
+                        if dados_graf:
+                            criar_grafico_fooof_com_stats(
+                                dados_graf, nome_banda, nome_canal,
+                                prefixo, fmin, fmax, saida, condicao
+                            )
+
+    except Exception as e:
+        print(f"Erro ao processar {arquivo}: {e}")
+        import traceback
+        traceback.print_exc()
+
+    salvar_diagnostico_falhas(prefixo, todas_falhas, saida)
+
+    # ── Salva médias regionais ao final de todos os canais (MODIFICAÇÃO 2 e 3)
+    calcular_e_salvar_medias_regionais(banco_regional, prefixo, saida)
+
+    return resumo_validos
+
+
+# ============================================================
+# EXECUÇÃO
+# ============================================================
+
+if __name__ == "__main__":
+    print("=" * 80)
+    print("ANÁLISE EEG — FOOOF BROADBAND (.set)")
+    print(f"R² threshold: {R2_THRESHOLD}  |  Mínimo intervalos válidos: {MIN_INTERVALOS_VALIDOS}")
+    print("Componente periódica: gaussianas FOOOF (Donoghue et al., 2020)")
+    print("Média entre intervalos: geométrica (log-espaço)")
+    print("=" * 80)
+
+    print("\nSelecione o arquivo EEG (.set):")
+    arquivo_set = escolher_arquivo_set()
+
+    print("\nSelecione a planilha de intervalos:")
+    planilha_intervalos = escolher_planilha_intervalos()
+
+    prefixo_saida = extrair_prefixo(os.path.basename(arquivo_set))
+    saida = os.path.join(os.path.dirname(arquivo_set), f"{prefixo_saida}_analise")
+    os.makedirs(saida, exist_ok=True)
+    print(f"\nResultados serão salvos em: {saida}")
+
+    print("\nCarregando intervalos da planilha...")
+    intervalos_pacientes = carregar_intervalos_planilha(planilha_intervalos)
+    if not intervalos_pacientes:
+        print("ERRO: Não foi possível carregar os intervalos da planilha!")
+        exit(1)
+
+    print(f"\n{'='*80}")
+    print(f"INICIANDO ANÁLISE — FOOOF BROADBAND ({FOOOF_FMIN:.0f}-{FOOOF_FMAX:.0f} Hz)")
+    print("="*80)
+
+    resumo_validos_global = processar_paciente(arquivo_set, intervalos_pacientes, saida)
+
+    caminho_resumo = os.path.join(saida, "RESUMO_GERAL_INTERVALOS_VALIDOS.txt")
+    with open(caminho_resumo, 'w', encoding='utf-8') as f:
+        f.write(f"RESUMO GERAL — R² threshold: {R2_THRESHOLD}  |  Mínimo: {MIN_INTERVALOS_VALIDOS} intervalos\n"
+                f"FOOOF fit: {FOOOF_FMIN:.0f}-{FOOOF_FMAX:.0f} Hz\n"
+                f"Componente periódica: gaussianas FOOOF (Donoghue et al., 2020)\n"
+                f"Média entre intervalos: geométrica (log-espaço)\n{'='*80}\n\n")
+        problemas = [i for i in resumo_validos_global if i['abaixo_minimo']]
+        f.write(f"Total de combinações canal/banda/condição: {len(resumo_validos_global)}\n")
+        f.write(f"Abaixo do mínimo ({MIN_INTERVALOS_VALIDOS}): {len(problemas)}\n\n")
+        for item in resumo_validos_global:
+            cond  = "Olhos Abertos" if item['condicao'] == 'OA' else "Olhos Fechados"
+            flag  = " ⚠" if item['abaixo_minimo'] else ""
+            f.write(f"{item['paciente']} | {item['canal']} | {item['banda'].upper()} | "
+                    f"{cond} → {item['validos']}/{item['total']} válidos{flag}\n")
+
+    log = {
+        "timestamp":   datetime.now().isoformat(),
+        "prefixo":     prefixo_saida,
+        "input_files": {"eeg_set": arquivo_set, "intervals_spreadsheet": planilha_intervalos},
+        "analysis_parameters": {
+            "interval_duration_sec":      DURACAO_INTERVALO,
+            "num_intervals_open_eyes":    NUM_INTERVALOS_OLHOS_ABERTOS,
+            "num_intervals_closed_eyes":  NUM_INTERVALOS_OLHOS_FECHADOS,
+            "min_valid_intervals":        MIN_INTERVALOS_VALIDOS,
+            "r2_threshold":               R2_THRESHOLD,
+        },
+        "fooof_parameters": fooof_config,
+        "fooof_fit_range":  {"fmin": FOOOF_FMIN, "fmax": FOOOF_FMAX},
+        "bands_analyzed":   bandas,
+        "methodological_notes": {
+            "unit_detection":          "automatic (FIFF field + amplitude heuristic)",
+            "periodic_component":      "reconstructed via FOOOF gaussian_params_ (Donoghue et al., 2020)",
+            "inter_interval_average":  "geometric mean (log-space) for PSD arrays",
+            "band_power_definition":   "area_original = integral of raw PSD (standard EEG); area_fit = integral of periodic component (FOOOF-specific)",
+            "peak_frequency_sd":       "std of all individual peak frequencies across valid intervals",
+            "regional_averages":       "broad regions = all channels sharing initial letter; specific = F3/F4/Fz, P3/P4/Pz, O1/O2/Oz",
+            "regional_freq_pico_sd":   "computed over ALL raw peaks of all channels in the region",
+        },
+        "software_info": {
+            "python_version": platform.python_version(),
+            "mne_version":    mne.__version__,
+            "platform":       platform.platform(),
+        },
+    }
+    caminho_log = os.path.join(saida, f"{prefixo_saida}_preproc_log.json")
+    salvar_log_json(caminho_log, log)
+
+    print(f"\n🧾 Log salvo em: {caminho_log}")
+    print("✔ RESUMO GERAL salvo com sucesso!")
+    print(f"\n{'='*80}")
+    print("PROCESSAMENTO CONCLUÍDO!")
+    print(f"Resultados salvos em: {saida}")
+    print("="*80)
