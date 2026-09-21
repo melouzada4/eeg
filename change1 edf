@@ -1190,13 +1190,13 @@ def processar_paciente(arquivo_set, saida):
 
 if __name__ == "__main__":
     print("=" * 80)
-    print("ANÁLISE EEG — FOOOF BROADBAND (.set)")
+    print("ANÁLISE EEG — FOOOF BROADBAND (.edf)")
     print(f"Épocas fixas de {DURACAO_INTERVALO}s  |  R² threshold: {R2_THRESHOLD}  |  Mínimo épocas válidas: {MIN_INTERVALOS_VALIDOS}")
     print("Componente periódica: gaussianas FOOOF (Donoghue et al., 2020)")
     print("Média entre épocas: geométrica (log-espaço)")
     print("=" * 80)
 
-    print("\nSelecione o arquivo EEG (.set):")
+    print("\nSelecione o arquivo EEG (.edf):")
     arquivo_set = escolher_arquivo_set()
 
     prefixo_saida = extrair_prefixo(os.path.basename(arquivo_set))
@@ -1228,7 +1228,7 @@ if __name__ == "__main__":
     log = {
         "timestamp":   datetime.now().isoformat(),
         "prefixo":     prefixo_saida,
-        "input_files": {"eeg_set": arquivo_set},
+        "input_files": {"eeg_edf": arquivo_set},
         "analysis_parameters": {
             "epoch_duration_sec":         DURACAO_INTERVALO,
             "epoching":                   "fixed-length, non-overlapping, epochs containing 'boundary' events discarded",
