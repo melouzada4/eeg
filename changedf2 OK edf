@@ -830,7 +830,7 @@ def calcular_e_salvar_medias_regionais(banco_regional, prefixo, pasta_analise):
     with open(caminho, 'w', encoding='utf-8') as f:
         f.write(f"MÉDIAS REGIONAIS — {prefixo}\n")
         f.write(f"R² threshold: {R2_THRESHOLD}  |  FOOOF fit: {FOOOF_FMIN:.0f}-{FOOOF_FMAX:.0f} Hz\n")
-        f.write(f"Componente periódica: gaussianas FOOOF (Donoghue et al., 2020)\n")
+        f.write(f"Componente periódica: gaussianas FOOOF\n")
         f.write("=" * 80 + "\n")
         f.write("\nNOTAS METODOLÓGICAS:\n")
         f.write("  • PSD Periódica: média (e DP) calculada sobre as médias dos canais da região.\n")
@@ -927,7 +927,7 @@ def salvar_resultados_completo(saida, arquivo, prefixo, nome_canal, nome_banda,
         f.write(f"Arquivo: {arquivo}\nCanal: {nome_canal}\nBanda: {nome_banda.upper()}\n")
         f.write(f"FOOOF fit: {FOOOF_FMIN:.0f}-{FOOOF_FMAX:.0f} Hz  |  R² threshold: {R2_THRESHOLD}\n")
         f.write(f"Épocas fixas de {DURACAO_INTERVALO}s\n")
-        f.write(f"Componente periódica: reconstruída via gaussianas (Donoghue et al., 2020)\n")
+        f.write(f"Componente periódica: reconstruída via gaussianas\n")
         f.write(f"Média entre épocas: geométrica (log-espaço)\n{'='*80}\n\n")
         f.write("1. RESUMO — MÉDIAS DAS ÉPOCAS:\n" + "-"*50 + "\n")
         f.write(bloco_media("REGISTRO COMPLETO", media))
@@ -1192,7 +1192,7 @@ if __name__ == "__main__":
     print("=" * 80)
     print("ANÁLISE EEG — FOOOF BROADBAND (.edf)")
     print(f"Épocas fixas de {DURACAO_INTERVALO}s  |  R² threshold: {R2_THRESHOLD}  |  Mínimo épocas válidas: {MIN_INTERVALOS_VALIDOS}")
-    print("Componente periódica: gaussianas FOOOF (Donoghue et al., 2020)")
+    print("Componente periódica: gaussianas FOOOF")
     print("Média entre épocas: geométrica (log-espaço)")
     print("=" * 80)
 
@@ -1215,7 +1215,7 @@ if __name__ == "__main__":
         f.write(f"RESUMO GERAL — R² threshold: {R2_THRESHOLD}  |  Mínimo: {MIN_INTERVALOS_VALIDOS} épocas\n"
                 f"FOOOF fit: {FOOOF_FMIN:.0f}-{FOOOF_FMAX:.0f} Hz\n"
                 f"Épocas fixas de {DURACAO_INTERVALO}s\n"
-                f"Componente periódica: gaussianas FOOOF (Donoghue et al., 2020)\n"
+                f"Componente periódica: gaussianas FOOOF\n"
                 f"Média entre épocas: geométrica (log-espaço)\n{'='*80}\n\n")
         problemas = [i for i in resumo_validos_global if i['abaixo_minimo']]
         f.write(f"Total de combinações canal/banda: {len(resumo_validos_global)}\n")
@@ -1240,7 +1240,7 @@ if __name__ == "__main__":
         "bands_analyzed":   bandas,
         "methodological_notes": {
             "unit_detection":          "automatic (FIFF field + amplitude heuristic)",
-            "periodic_component":      "reconstructed via FOOOF gaussian_params_ (Donoghue et al., 2020)",
+            "periodic_component":      "reconstructed via FOOOF gaussian_params_",
             "inter_epoch_average":     "geometric mean (log-space) for PSD arrays",
             "band_power_definition":   "area_original = integral of raw PSD (standard EEG); area_fit = integral of periodic component (FOOOF-specific)",
             "peak_frequency_sd":       "std of channel-level mean peak frequencies (not raw peaks)",
