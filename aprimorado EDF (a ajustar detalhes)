@@ -1,0 +1,962 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+ANÁLISE EEG — FOOOF sobre PSD de Welch promediado (UM ajuste por canal)
+
+PRINCÍPIO DE COERÊNCIA
+    Para cada canal existe UM espectro (média aritmética de N janelas de Welch)
+    e UM ajuste FOOOF. O .txt, o .csv, o gráfico e as médias regionais leem
+    exatamente esse mesmo objeto (`mod`) e as métricas de banda derivadas dele
+    (`met`). Não existe mais "média de modelos" nem média geométrica: gráfico e
+    texto não têm como divergir.
+
+FLUXO
+    1. Lê o EDF, mantém só canais de EEG (por nome), converte para µV.
+    2. Passa-alta (0,5 Hz) aplicado SEPARADAMENTE em cada trecho contínuo (lacunas e
+       emendas não são filtradas por cima). Épocas de 1 s servem APENAS para
+       aceitar/rejeitar dado (boundary/BAD, emendas, amplitude pico-a-pico).
+    3. Épocas boas adjacentes viram segmentos contíguos.
+    4. Por canal: Welch (janela 2 s ou 4 s conforme a quantidade de dado limpo,
+       50 % overlap, Hann, sem zero-padding) nos segmentos, média aritmética
+       das janelas -> um espectro.
+    5. Um FOOOF por canal (1–40 Hz). QC do canal: R² e expoente.
+    6. Métricas por banda = fatias do mesmo ajuste.
+    7. Médias regionais (média ± DP ENTRE CANAIS aprovados, ddof=1).
+
+USO
+    python analise_eeg_fooof.py arquivo.edf [outro.edf ...] [--cond OA|OF] [--saida PASTA]
+    python analise_eeg_fooof.py            (abre janela para escolher o arquivo)
+    python analise_eeg_fooof.py --teste    (roda em dados sintéticos e checa coerência)
+
+REQUISITOS: numpy, scipy, matplotlib, mne, fooof (1.x). Para o specparam 2.x o
+código de `ajustar_fooof` precisa ser adaptado (API reescrita).
+"""
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import os
+import platform
+import re
+import sys
+import warnings
+from collections import Counter, OrderedDict
+from datetime import datetime
+
+import numpy as np
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+from scipy.signal import butter, detrend, sosfiltfilt, welch
+
+warnings.filterwarnings("ignore", category=DeprecationWarning, module=r"^fooof(\.|$)")
+warnings.filterwarnings("ignore", category=RuntimeWarning, message=r"^Limited .* annotation\(s\)")
+
+# ============================================================================
+# CONFIGURAÇÃO
+# ============================================================================
+
+# --- Estimação espectral -----------------------------------------------------
+JANELA_WELCH_S = None    # None = automático: 2 s se o dado aceito < JANELA_AUTO_LIMIAR_S, senão 4 s
+JANELA_AUTO_LIMIAR_S = 150.0
+OVERLAP_WELCH = 0.5      # 50 %; nfft = nperseg (sem zero-padding)
+
+# --- Seleção de dados --------------------------------------------------------
+DURACAO_EPOCA_S = 1.0        # unidade de aceitar/rejeitar dado (NÃO é a unidade de estimação)
+AMPL_PTP_UV = 150.0          # rejeita época se pico-a-pico (após remover tendência linear) > limite
+FRAC_CANAL_RUIM = 0.40       # canal com > 40 % das épocas acima do limite é considerado ruim (excluído)
+MIN_TEMPO_LIMPO_S = 60.0     # abaixo disto a análise é interrompida
+TEMPO_RECOMENDADO_S = 120.0  # abaixo disto a análise roda, mas com AVISO (interprete com cautela)
+JUNCOES_MANUAIS_S = []       # tempos (s) de emendas de blocos SEM marcador no EDF, ex.: [120.0]
+
+# --- Saída ---------------------------------------------------------------
+CSV_DECIMAL = '.'            # use ',' se for abrir os .csv direto no Excel em português
+
+# --- Pré-processamento opcional (padrão: nenhum, assume dado já preparado) ---
+FILTRO_PASSA_ALTA_HZ = 0.5  # None = não filtrar (se o dado já veio filtrado). Sem passa-alta, derivas
+                             # lentas estouram o limite de amplitude e contaminam o delta.
+MARGEM_FILTRO_S = 2.0        # descarta esta margem nas bordas de cada trecho filtrado (transiente)
+MIN_BLOCO_FILTRO_S = 10.0    # trechos contínuos menores que isto são descartados (curtos demais p/ filtrar)
+REF_MEDIA_COMUM = False      # True = re-referência para a média dos canais EEG
+
+# --- FOOOF -------------------------------------------------------------------
+FOOOF_FMIN = 1.0
+FOOOF_FMAX = 40.0
+R2_MIN = 0.90                # QC POR CANAL (ponto de partida; inspecione os gráficos dos reprovados)
+fooof_config = {
+    'peak_width_limits': [1.0, 8.0],   # limite inferior >= 2x resolução (0,25 Hz) -> ok
+    'max_n_peaks':       6,
+    'min_peak_height':   0.1,          # log10
+    'peak_threshold':    2.0,
+    'aperiodic_mode':    'fixed',      # o código assume 'fixed' (offset, expoente)
+    'verbose':           False,
+}
+
+# --- Bandas (mantidas como no script original) -------------------------------
+bandas = OrderedDict([
+    ('delta', (1.0, 4.0)),
+    ('theta', (4.1, 8.0)),
+    ('alpha', (8.1, 13.0)),
+    ('beta',  (13.1, 30.0)),
+])
+ORDEM_BANDAS_RELATORIO = ['beta', 'alpha', 'theta', 'delta']
+
+# --- Regiões (listas EXPLÍCITAS; FC/FT/CP/TP/PO ficam de fora de propósito) ---
+REGIOES_ESPECIFICAS = OrderedDict([
+    ('F específico (F3, F4, Fz)', ['F3', 'F4', 'FZ']),
+    ('P específico (P3, P4, Pz)', ['P3', 'P4', 'PZ']),
+    ('O específico (O1, O2, Oz)', ['O1', 'O2', 'OZ']),
+])
+REGIOES_AMPLAS = OrderedDict([          # regex sobre o nome normalizado (maiúsculo)
+    ('Frontal',   r'^(FP|AF|F)(Z|\d+)$'),
+    ('Temporal',  r'^T\d+$'),
+    ('Parietal',  r'^P(Z|\d+)$'),
+    ('Occipital', r'^O(Z|\d+)$'),
+])
+
+# Nome de canal de EEG (10-20 / 10-10). Rejeita ECG, EOG, Photic, Pulse, Trigger etc.
+_RE_EEG = re.compile(r'^(FP|AF|FC|FT|CP|TP|PO|F|C|T|P|O|I)(Z|\d{1,2})$')
+
+
+# ============================================================================
+# NOMES, ARQUIVO, CONDIÇÃO
+# ============================================================================
+
+def normalizar_canal(nome: str) -> str:
+    """'EEG Fz-REF' / 'Fz.' / 'fz' -> 'FZ'."""
+    n = nome.strip()
+    n = re.sub(r'^EEG[\s_\-]*', '', n, flags=re.I)
+    n = re.sub(r'[\s_\-]*(REF|LE|RE|AV|AVG|A1A2|A1|A2|M1|M2)$', '', n, flags=re.I)
+    return n.strip('. ').upper()
+
+
+def eh_canal_eeg(nome_norm: str) -> bool:
+    return bool(_RE_EEG.match(nome_norm))
+
+
+def extrair_prefixo(nome: str) -> str:
+    stem = os.path.splitext(os.path.basename(nome))[0]
+    m = re.search(r'(\d+_T\d+)', stem, re.I)
+    return m.group(1).upper() if m else stem
+
+
+def inferir_condicao(nome: str) -> str:
+    m = re.search(r'(?<![A-Za-z])(OA|OF|EO|EC)(?![A-Za-z])', os.path.basename(nome), re.I)
+    return m.group(1).upper() if m else 'TODO'
+
+
+def escolher_arquivo_eeg() -> str:
+    import tkinter as tk
+    from tkinter import filedialog
+    root = tk.Tk()
+    root.withdraw()
+    arq = filedialog.askopenfilename(title="Selecione o arquivo EEG (.edf)",
+                                     filetypes=[("EDF", "*.edf"), ("Todos", "*.*")])
+    if not arq:
+        raise SystemExit("Nenhum arquivo selecionado.")
+    return arq
+
+
+def _nome_seguro(s: str) -> str:
+    return re.sub(r'[^\w\-]+', '_', s)
+
+
+# ============================================================================
+# LEITURA DO EDF
+# ============================================================================
+
+def carregar_edf(caminho: str) -> dict:
+    """Lê o EDF e devolve só canais de EEG (µV) + marcadores que bloqueiam épocas."""
+    import mne
+    mne.set_log_level('WARNING')
+    raw = mne.io.read_raw_edf(caminho, preload=True, verbose='WARNING')
+    srate = float(raw.info['sfreq'])
+
+    idx, vistos, ignorados = [], set(), []
+    for i, nome in enumerate(raw.ch_names):
+        n = normalizar_canal(nome)
+        if eh_canal_eeg(n) and n not in vistos:
+            idx.append(i)
+            vistos.add(n)
+        else:
+            ignorados.append(nome)
+    if not idx:
+        raise ValueError("Nenhum canal de EEG reconhecido pelos nomes: " + ", ".join(raw.ch_names))
+
+    # MNE entrega EEG em Volts -> µV
+    dados_uv = raw.get_data(picks=idx) * 1e6
+
+    ann = raw.annotations
+    bloqueios = []
+    for desc, onset, dur in zip(ann.description, ann.onset, ann.duration):
+        d = str(desc).lower()
+        if 'boundary' in d or d.startswith('bad'):
+            s0 = int(raw.time_as_index(onset)[0])
+            bloqueios.append((s0, s0 + max(int(round(dur * srate)), 1)))
+
+    meta = {
+        'arquivo': caminho,
+        'duracao_s': dados_uv.shape[1] / srate,
+        'anotacoes': dict(Counter(map(str, ann.description))),
+        'highpass_hz': raw.info.get('highpass'),
+        'lowpass_hz': raw.info.get('lowpass'),
+        'canais_ignorados': ignorados,
+    }
+    return {'dados_uv': dados_uv, 'srate': srate,
+            'nomes': [raw.ch_names[i] for i in idx],
+            'bloqueios': bloqueios, 'meta': meta}
+
+
+# ============================================================================
+# SELEÇÃO DE DADO (épocas de 2 s só para aceitar/rejeitar)
+# ============================================================================
+
+def selecionar_epocas(dados: np.ndarray, srate: float, bloqueios: list) -> dict:
+    L = int(round(DURACAO_EPOCA_S * srate))
+    n_ch, n_t = dados.shape
+    n_ep = n_t // L
+    if n_ep < 1:
+        raise ValueError("Registro menor que uma época.")
+
+    ok_marc = np.ones(n_ep, dtype=bool)
+    for s0, s1 in bloqueios:
+        k0, k1 = max(s0 // L, 0), min((s1 - 1) // L, n_ep - 1)
+        if k1 >= k0:
+            ok_marc[k0:k1 + 1] = False
+    if not ok_marc.any():
+        raise ValueError("Todas as épocas caem em lacunas/marcadores.")
+
+    ep = detrend(dados[:, :n_ep * L].reshape(n_ch, n_ep, L), axis=-1, type='linear')
+    ptp = ep.max(axis=-1) - ep.min(axis=-1)                    # (canais, épocas)
+    excede = ptp > AMPL_PTP_UV
+
+    # o QC de CANAL só olha épocas fora de lacunas/marcadores (lacunas zeradas enganariam o teste)
+    ptp_v, exc_v = ptp[:, ok_marc], excede[:, ok_marc]
+    frac_excede = exc_v.mean(axis=1)
+    plano = np.median(ptp_v, axis=1) < 0.1
+    ruim = plano | (frac_excede > FRAC_CANAL_RUIM)
+    bons = ~ruim
+    if not bons.any():
+        raise ValueError("Todos os canais foram considerados ruins (planos ou com amplitude excessiva).")
+
+    ok_ampl = ~excede[bons].any(axis=0)
+    ok = ok_ampl & ok_marc
+    return {
+        'L': L, 'n_ep': n_ep, 'ok': ok, 'canais_ruins': ruim, 'plano': plano,
+        'frac_excede_canal': frac_excede,
+        'n_rej_marcador': int((~ok_marc).sum()),
+        'n_rej_amplitude': int((ok_marc & ~ok_ampl).sum()),
+        'n_ok': int(ok.sum()),
+    }
+
+
+def filtrar_passa_alta_por_blocos(dados, srate, bloqueios, fc):
+    """Passa-alta Butterworth (4ª ordem, fase zero) aplicado SEPARADAMENTE em cada trecho contínuo
+    entre lacunas/marcadores. Cada trecho tem a média removida antes (dado sem filtro traz offset DC
+    grande, que geraria transiente enorme). Devolve (dados_filtrados, bloqueios_extras, n_trechos).
+
+    bloqueios_extras = margens de borda (transiente) + trechos curtos demais para filtrar; viram
+    épocas rejeitadas. Trechos bloqueados NÃO são filtrados nem usados.
+    """
+    n = dados.shape[1]
+    marc = np.zeros(n, dtype=bool)
+    for s0, s1 in bloqueios:
+        marc[max(s0, 0):min(s1, n)] = True
+    d = np.diff(np.r_[0, (~marc).astype(np.int8), 0])
+    inicios, fins = np.flatnonzero(d == 1), np.flatnonzero(d == -1)
+
+    sos = butter(4, fc, btype='highpass', fs=srate, output='sos')
+    margem = int(round(MARGEM_FILTRO_S * srate))
+    minimo = int(round(MIN_BLOCO_FILTRO_S * srate))
+    out, extras, n_ok = dados.copy(), [], 0
+    for a, b in zip(inicios, fins):
+        if b - a < minimo:
+            extras.append((int(a), int(b)))
+            continue
+        seg = dados[:, a:b] - dados[:, a:b].mean(axis=1, keepdims=True)
+        out[:, a:b] = sosfiltfilt(sos, seg, axis=-1, padlen=min(int(3 * srate), (b - a) - 1))
+        extras += [(int(a), int(a + margem)), (int(b - margem), int(b))]
+        n_ok += 1
+    return out, extras, n_ok
+
+
+def escolher_janela(tempo_aceito_s: float) -> float:
+    if JANELA_WELCH_S:
+        return float(JANELA_WELCH_S)
+    return 2.0 if tempo_aceito_s < JANELA_AUTO_LIMIAR_S else 4.0
+
+
+def segmentos_contiguos(ok: np.ndarray, L: int, nperseg: int) -> list:
+    """Épocas boas ADJACENTES viram segmentos; segmentos < 1 janela são descartados."""
+    segs, ini = [], None
+    for k, bom in enumerate(ok):
+        if bom and ini is None:
+            ini = k
+        elif not bom and ini is not None:
+            segs.append((ini * L, k * L))
+            ini = None
+    if ini is not None:
+        segs.append((ini * L, len(ok) * L))
+    return [(a, b) for a, b in segs if b - a >= nperseg]
+
+
+# ============================================================================
+# ESPECTRO (Welch, média ARITMÉTICA das janelas)
+# ============================================================================
+
+def welch_segmentos(x, fs, nperseg, noverlap, segmentos):
+    """Média aritmética de todas as janelas de todos os segmentos (nenhuma janela cruza emenda)."""
+    step = nperseg - noverlap
+    soma, pesos, freqs = None, 0, None
+    for s0, s1 in segmentos:
+        seg = x[s0:s1]
+        if seg.size < nperseg:
+            continue
+        f, p = welch(seg, fs=fs, nperseg=nperseg, noverlap=noverlap, nfft=nperseg,
+                     window='hann', detrend='constant', scaling='density', average='mean')
+        n = 1 + (seg.size - nperseg) // step
+        if freqs is None:
+            freqs, soma = f, p * n
+        else:
+            soma += p * n
+        pesos += n
+    if soma is None:
+        return None, None, 0
+    return freqs, soma / pesos, int(pesos)
+
+
+# ============================================================================
+# FOOOF — um ajuste por canal
+# ============================================================================
+
+def ajustar_fooof(freqs: np.ndarray, psd: np.ndarray):
+    """Retorna (mod, erro). Tudo em µV²/Hz, escala LINEAR, na mesma grade `freq`.
+
+    modelo completo  = 10**fooofed_spectrum_
+    aperiódico       = 10**(offset - expoente*log10 f)      (modo 'fixed')
+    periódico        = completo - aperiódico   (>= 0; = ap*(10**gaussianas - 1))
+    """
+    from fooof import FOOOF
+    m = (freqs >= FOOOF_FMIN) & (freqs <= FOOOF_FMAX)
+    f, p = freqs[m], psd[m]
+    if p.size < 10 or not np.all(np.isfinite(p)) or np.any(p <= 0):
+        return None, "PSD inválido (NaN/Inf/≤0 ou poucos pontos)"
+    try:
+        fm = FOOOF(**fooof_config)
+        fm.fit(f, p)
+    except Exception as e:                                   # noqa: BLE001
+        return None, f"exceção no FOOOF: {e}"
+
+    off, expo = float(fm.aperiodic_params_[0]), float(fm.aperiodic_params_[-1])
+    if not (np.isfinite(off) and np.isfinite(expo) and np.isfinite(fm.r_squared_)):
+        return None, "FOOOF não convergiu (parâmetros NaN)"
+
+    ap = 10 ** (off - expo * np.log10(f))
+    full = 10 ** np.asarray(fm.fooofed_spectrum_, dtype=float)
+    per = full - ap
+    picos = [(float(cf), float(pw), float(bw))
+             for cf, pw, bw in np.asarray(fm.peak_params_, dtype=float).reshape(-1, 3)]
+    return {'freq': f, 'psd': p, 'ap': ap, 'per': per, 'full': full,
+            'r2': float(fm.r_squared_), 'erro': float(fm.error_),
+            'offset': off, 'expoente': expo, 'picos': picos, 'fm': fm}, None
+
+
+def avaliar_canal(mod, erro):
+    if mod is None:
+        return False, erro
+    if mod['r2'] < R2_MIN:
+        return False, f"R²={mod['r2']:.3f} < {R2_MIN}"
+    if mod['expoente'] <= 0:
+        return False, f"expoente={mod['expoente']:.2f} ≤ 0 (espectro não decrescente: suspeita de EMG/ruído)"
+    return True, ''
+
+
+# ============================================================================
+# MÉTRICAS DE BANDA — fatias do MESMO ajuste
+# ============================================================================
+
+def _mascara(f, lo, hi):
+    return (f >= lo) & (f <= hi)
+
+
+def metricas_banda(mod: dict, banda: str) -> dict:
+    f = mod['freq']
+    df = float(f[1] - f[0])
+    lo, hi = bandas[banda]
+    m = _mascara(f, lo, hi)
+
+    def area(y):                           # integral discreta (soma * df): bandas particionam a grade
+        return float(np.sum(y[m]) * df)
+
+    area_total = sum(float(np.sum(mod['psd'][_mascara(f, a, b)]) * df) for a, b in bandas.values())
+    met = {
+        'psd_orig_media': float(np.mean(mod['psd'][m])), 'area_orig': area(mod['psd']),
+        'psd_ap_media':   float(np.mean(mod['ap'][m])),  'area_ap':   area(mod['ap']),
+        'psd_per_media':  float(np.mean(mod['per'][m])), 'area_per':  area(mod['per']),
+        'psd_full_media': float(np.mean(mod['full'][m])), 'area_full': area(mod['full']),
+    }
+    met['rel_orig'] = met['area_orig'] / area_total if area_total > 0 else None
+
+    picos = [p for p in mod['picos'] if lo <= p[0] <= hi]
+    met['n_picos'] = len(picos)
+    if picos:
+        cf, pw, bw = max(picos, key=lambda p: p[1])          # pico DOMINANTE = maior PW
+        met.update({'cf': cf, 'pw_log10': pw, 'pw_razao': 10 ** pw, 'bw': bw,
+                    'altura_linear': float(np.interp(cf, f, mod['per']))})
+    else:
+        met.update({'cf': None, 'pw_log10': None, 'pw_razao': None, 'bw': None, 'altura_linear': None})
+    return met
+
+
+# ============================================================================
+# REGIÕES
+# ============================================================================
+
+METRICAS_BANDA_REG = [
+    ('psd_orig_media', 'PSD original',                        'µV²/Hz', 5),
+    ('rel_orig',       'Potência relativa (original)',        '',       4),
+    ('area_orig',      'Área original',                       'µV²',    5),
+    ('psd_ap_media',   'PSD aperiódica',                      'µV²/Hz', 5),
+    ('psd_per_media',  'PSD periódica (excesso sobre aper.)', 'µV²/Hz', 5),
+    ('area_per',       'Área periódica',                      'µV²',    5),
+]
+METRICAS_PICO_REG = [
+    ('cf',            'Frequência do pico dominante',    'Hz',     3),
+    ('pw_log10',      'PW (log10 sobre o aperiódico)',   '',       3),
+    ('altura_linear', 'Altura sobre o aperiódico',       'µV²/Hz', 5),
+    ('bw',            'Largura do pico (BW)',            'Hz',     3),
+]
+
+
+def _resumo(valores):
+    v = np.array([x for x in valores if x is not None and np.isfinite(x)], dtype=float)
+    if v.size == 0:
+        return {'n': 0, 'media': None, 'dp': None, 'min': None, 'max': None}
+    return {'n': int(v.size), 'media': float(v.mean()),
+            'dp': float(v.std(ddof=1)) if v.size > 1 else None,
+            'min': float(v.min()), 'max': float(v.max())}
+
+
+def resumir_regiao(canais, res_banda, info):
+    out = {'canais': list(canais),
+           'aper': {k: _resumo([info[c][k] for c in canais]) for k in ('r2', 'expoente', 'offset')},
+           'bandas': {}}
+    for b in bandas:
+        d = {k: _resumo([res_banda[c][b][k] for c in canais]) for k, *_ in METRICAS_BANDA_REG}
+        d.update({k: _resumo([res_banda[c][b][k] for c in canais]) for k, *_ in METRICAS_PICO_REG})
+        d['n_com_pico'] = int(sum(res_banda[c][b]['n_picos'] > 0 for c in canais))
+        out['bandas'][b] = d
+    return out
+
+
+def montar_regioes(info: dict, res_banda: dict) -> OrderedDict:
+    """info[canal_norm] tem 'aprovado'; só aprovados entram nas médias."""
+    aprov = [c for c, i in info.items() if i['aprovado']]
+    todos = list(info)
+    regs = OrderedDict([('ESPECÍFICAS', OrderedDict()), ('AMPLAS', OrderedDict())])
+    for nome, lista in REGIOES_ESPECIFICAS.items():
+        membros = [c for c in todos if c in lista]
+        regs['ESPECÍFICAS'][nome] = (membros, [c for c in aprov if c in lista])
+    for nome, rx in REGIOES_AMPLAS.items():
+        membros = [c for c in todos if re.match(rx, c)]
+        regs['AMPLAS'][nome] = (membros, [c for c in aprov if re.match(rx, c)])
+    resumo = OrderedDict()
+    for tipo, d in regs.items():
+        resumo[tipo] = OrderedDict()
+        for nome, (membros, ok) in d.items():
+            r = resumir_regiao(ok, res_banda, info) if ok else None
+            resumo[tipo][nome] = {'membros': membros, 'aprovados': ok, 'resumo': r}
+    return resumo
+
+
+# ============================================================================
+# SAÍDAS: texto, csv, qc, log
+# ============================================================================
+
+def _csv(v):
+    """Valor -> texto de CSV ('' para None; separador decimal configurável)."""
+    if v is None:
+        return ''
+    if isinstance(v, (float, np.floating)):
+        return repr(float(v)).replace('.', CSV_DECIMAL)
+    return v
+
+
+def _f(v, d=4):
+    return 'N/A' if v is None or not np.isfinite(v) else f'{v:.{d}f}'
+
+
+def _ms(r, d):
+    if r is None or r['n'] == 0:
+        return 'N/A'
+    dp = 'N/A' if r['dp'] is None else _f(r['dp'], d)
+    return f"{_f(r['media'], d)} ± {dp}  (n={r['n']})"
+
+
+def escrever_relatorio_regional(caminho, prefixo, cond, regioes, meta_run):
+    with open(caminho, 'w', encoding='utf-8') as f:
+        f.write(f"MÉDIAS REGIONAIS — {prefixo} — condição: {cond}\n")
+        f.write(f"FOOOF {FOOOF_FMIN:.0f}–{FOOOF_FMAX:.0f} Hz | Welch {meta_run['janela_s']:g} s, overlap "
+                f"{OVERLAP_WELCH*100:.0f}% | R² mín. por canal {R2_MIN} | "
+                f"{meta_run['n_janelas']} janelas, {meta_run['tempo_limpo_s']:.0f} s de dado limpo\n")
+        if meta_run['tempo_limpo_s'] < TEMPO_RECOMENDADO_S:
+            f.write(f"⚠ Dado limpo abaixo do recomendado ({TEMPO_RECOMENDADO_S:g} s): interprete com cautela.\n")
+        f.write("=" * 80 + "\nNOTAS:\n"
+                "  • Cada canal aprovado contribui com UM valor (do seu único ajuste FOOOF).\n"
+                "  • Média ± DP são ENTRE CANAIS (DP amostral, ddof=1; N/A se n=1).\n"
+                "  • Pico dominante = pico com maior PW dentro da banda; estatística só sobre\n"
+                "    canais em que houve pico (veja 'presente em k/n canais').\n"
+                "  • PSD periódica = excesso do modelo sobre o aperiódico (NÃO é potência total da banda).\n"
+                "  • Áreas = soma discreta × Δf. Ordem das bandas: Beta → Alpha → Theta → Delta.\n"
+                + "=" * 80 + "\n")
+        for tipo, d in regioes.items():
+            f.write(f"\n\n###  REGIÕES {tipo}  ###\n")
+            for nome, dados in d.items():
+                f.write(f"\n{'─' * 70}\n{nome}\n{'─' * 70}\n")
+                membros, ok, r = dados['membros'], dados['aprovados'], dados['resumo']
+                f.write(f"Canais presentes: {', '.join(membros) if membros else '—'}\n")
+                if r is None:
+                    f.write("Sem canais aprovados nesta região.\n")
+                    continue
+                f.write(f"Canais incluídos ({len(ok)}): {', '.join(ok)}\n")
+                excl = [c for c in membros if c not in ok]
+                if excl:
+                    f.write(f"Excluídos pelo QC: {', '.join(excl)} (motivo em QC_canais.txt)\n")
+                f.write(f"Aperiódico — expoente: {_ms(r['aper']['expoente'], 3)} | "
+                        f"offset: {_ms(r['aper']['offset'], 3)} | R²: {_ms(r['aper']['r2'], 4)}\n")
+                for b in ORDEM_BANDAS_RELATORIO:
+                    lo, hi = bandas[b]
+                    bd = r['bandas'][b]
+                    f.write(f"\n  Banda {b.upper()} ({lo}–{hi} Hz)\n")
+                    for k, rot, un, dec in METRICAS_BANDA_REG:
+                        f.write(f"    {rot} [{un}]: {_ms(bd[k], dec)}\n" if un else
+                                f"    {rot}: {_ms(bd[k], dec)}\n")
+                    f.write(f"    Pico dominante — presente em {bd['n_com_pico']}/{len(ok)} canais\n")
+                    for k, rot, un, dec in METRICAS_PICO_REG:
+                        rr = bd[k]
+                        extra = f"  [min {_f(rr['min'], dec)} – máx {_f(rr['max'], dec)}]" if rr['n'] else ''
+                        f.write(f"      {rot}{f' [{un}]' if un else ''}: {_ms(rr, dec)}{extra}\n")
+        f.write("\n" + "=" * 80 + "\nFIM\n")
+
+
+def escrever_csv_canais(caminho, prefixo, cond, info, res_banda, meta_run):
+    cols = (['arquivo', 'condicao', 'canal', 'aprovado', 'motivo_qc', 'r2', 'erro', 'offset', 'expoente',
+             'n_janelas', 'tempo_limpo_s', 'banda'] +
+            [k for k, *_ in METRICAS_BANDA_REG] + ['psd_full_media', 'area_full', 'n_picos', 'cf', 'pw_log10',
+                                                   'pw_razao', 'bw', 'altura_linear'])
+    with open(caminho, 'w', newline='', encoding='utf-8-sig') as fh:
+        w = csv.writer(fh, delimiter=';')
+        w.writerow(cols)
+        for c, i in info.items():
+            for b in bandas:
+                m = res_banda.get(c, {}).get(b)
+                if m is None:
+                    continue
+                linha = {**m, 'arquivo': prefixo, 'condicao': cond, 'canal': c, 'aprovado': int(i['aprovado']),
+                         'motivo_qc': i['motivo'], 'r2': i['r2'], 'erro': i['erro'], 'offset': i['offset'],
+                         'expoente': i['expoente'], 'n_janelas': meta_run['n_janelas'],
+                         'tempo_limpo_s': meta_run['tempo_limpo_s'], 'banda': b}
+                w.writerow([_csv(linha.get(k)) for k in cols])
+
+
+def escrever_csv_regioes(caminho, prefixo, cond, regioes):
+    with open(caminho, 'w', newline='', encoding='utf-8-sig') as fh:
+        w = csv.writer(fh, delimiter=';')
+        w.writerow(['arquivo', 'condicao', 'tipo', 'regiao', 'banda', 'metrica', 'n', 'media', 'dp', 'min', 'max'])
+        for tipo, d in regioes.items():
+            for nome, dados in d.items():
+                r = dados['resumo']
+                if r is None:
+                    continue
+                for k, rr in r['aper'].items():
+                    w.writerow([prefixo, cond, tipo, nome, 'todas', k, rr['n'],
+                                *[_csv(rr[x]) for x in ('media', 'dp', 'min', 'max')]])
+                for b in bandas:
+                    for k, *_ in METRICAS_BANDA_REG + METRICAS_PICO_REG:
+                        rr = r['bandas'][b][k]
+                        w.writerow([prefixo, cond, tipo, nome, b, k, rr['n'],
+                                    *[_csv(rr[x]) for x in ('media', 'dp', 'min', 'max')]])
+
+
+def escrever_relatorio_canais(caminho, prefixo, cond, info, res_banda):
+    with open(caminho, 'w', encoding='utf-8') as f:
+        f.write(f"RELATÓRIO POR CANAL — {prefixo} — {cond}\n{'=' * 80}\n")
+        for c, i in info.items():
+            f.write(f"\nCANAL {c}  [{'APROVADO' if i['aprovado'] else 'REPROVADO: ' + i['motivo']}]\n")
+            f.write(f"  R²={_f(i['r2'])}  erro={_f(i['erro'])}  expoente={_f(i['expoente'], 3)}  "
+                    f"offset={_f(i['offset'], 3)}\n")
+            f.write("  Picos (CF Hz | PW log10 | BW Hz): " +
+                    ("; ".join(f"{cf:.2f} | {pw:.3f} | {bw:.2f}" for cf, pw, bw in i['picos']) or "nenhum") + "\n")
+            for b in ORDEM_BANDAS_RELATORIO:
+                m = res_banda.get(c, {}).get(b)
+                if not m:
+                    continue
+                f.write(f"  {b.upper():6s} PSD orig={_f(m['psd_orig_media'], 5)}  rel={_f(m['rel_orig'], 3)}  "
+                        f"ap={_f(m['psd_ap_media'], 5)}  per={_f(m['psd_per_media'], 5)}  "
+                        f"área orig={_f(m['area_orig'], 4)} ap={_f(m['area_ap'], 4)} per={_f(m['area_per'], 4)} µV²  "
+                        f"| pico dom: CF={_f(m['cf'], 2)} PW={_f(m['pw_log10'], 3)} (n={m['n_picos']})\n")
+
+
+def escrever_qc(caminho, prefixo, cond, meta, sel, canais_todos, info, meta_run):
+    L = sel['L']
+    with open(caminho, 'w', encoding='utf-8') as f:
+        f.write(f"QC — {prefixo} — {cond}\n{'=' * 80}\n")
+        f.write(f"Duração: {meta.get('duracao_s', float('nan')):.1f} s | filtro do arquivo: "
+                f"passa-alta={meta.get('highpass_hz')} Hz, passa-baixa={meta.get('lowpass_hz')} Hz\n")
+        f.write(f"Anotações no EDF: {meta.get('anotacoes') or 'nenhuma'}\n")
+        if not meta.get('anotacoes') and not JUNCOES_MANUAIS_S:
+            f.write("  ⚠ Sem marcadores. Se o arquivo é emenda de blocos, informe os tempos em "
+                    "JUNCOES_MANUAIS_S (uma emenda dentro de uma janela vaza potência em todas as frequências).\n")
+        f.write(f"Canais ignorados (não-EEG): {', '.join(meta.get('canais_ignorados', [])) or '—'}\n\n")
+        f.write(f"Épocas de {DURACAO_EPOCA_S:g} s: total={sel['n_ep']}  aceitas={sel['n_ok']}  "
+                f"rejeitadas por marcador={sel['n_rej_marcador']}  por amplitude (> {AMPL_PTP_UV:g} µV)="
+                f"{sel['n_rej_amplitude']}\n")
+        f.write(f"Filtro: {meta_run.get('filtro', '—')} | janela de Welch: {meta_run.get('janela_s', '—')} s\n")
+        f.write(f"Dado limpo em segmentos utilizáveis: {meta_run['tempo_limpo_s']:.1f} s "
+                f"(mín. {MIN_TEMPO_LIMPO_S:g} s; recomendado {TEMPO_RECOMENDADO_S:g} s) | "
+                f"janelas Welch: {meta_run['n_janelas']}\n")
+        if meta_run['tempo_limpo_s'] < MIN_TEMPO_LIMPO_S:
+            f.write("  ❌ ABAIXO DO MÍNIMO — análise interrompida.\n")
+        elif meta_run['tempo_limpo_s'] < TEMPO_RECOMENDADO_S:
+            f.write("  ⚠ Abaixo do recomendado — interprete com cautela.\n")
+        f.write("\n")
+        f.write("Canais removidos antes da análise (planos ou > "
+                f"{FRAC_CANAL_RUIM*100:.0f}% das épocas acima do limite):\n")
+        ruins = [(canais_todos[i], sel['frac_excede_canal'][i], sel['plano'][i])
+                 for i in range(len(canais_todos)) if sel['canais_ruins'][i]]
+        f.write("  " + ("; ".join(f"{n} ({'plano' if pl else f'{fr*100:.0f}% das épocas'})" for n, fr, pl in ruins)
+                        if ruins else "nenhum") + "\n\n")
+        f.write("QC por canal (R² mínimo, expoente > 0):\n")
+        for c, i in info.items():
+            f.write(f"  {c:6s} {'OK       ' if i['aprovado'] else 'REPROVADO'}  R²={_f(i['r2'], 3)}  "
+                    f"expoente={_f(i['expoente'], 2)}  {i['motivo']}\n")
+
+
+# ============================================================================
+# GRÁFICOS (leem o MESMO `mod` e `met` do texto)
+# ============================================================================
+
+_COR = {'orig': '#000000', 'full': '#e74c3c', 'ap': '#3498db', 'per': '#2ecc71'}
+
+
+def _desenhar_modelo(ax, mod, mascara=None):
+    f = mod['freq']
+    m = np.ones_like(f, bool) if mascara is None else mascara
+    ax.plot(f[m], mod['psd'][m], color=_COR['orig'], lw=1.4, label='Espectro original (Welch, média de janelas)')
+    ax.plot(f[m], mod['full'][m], color=_COR['full'], lw=2, label='Modelo completo FOOOF')
+    ax.plot(f[m], mod['ap'][m], color=_COR['ap'], lw=2, ls='--', label='Componente aperiódica')
+    ax.fill_between(f[m], mod['ap'][m], mod['full'][m], color=_COR['per'], alpha=0.35,
+                    label='Componente periódica (gaussianas)')
+    ax.set_xlabel('Frequência (Hz)')
+    ax.set_ylabel('PSD (µV²/Hz)')
+    ax.grid(True, ls='--', lw=0.5, alpha=0.3)
+
+
+def grafico_canal(mod, canal, info_c, prefixo, cond, pasta, n_janelas):
+    fig, ax = plt.subplots(figsize=(11, 6))
+    _desenhar_modelo(ax, mod)
+    ax.set_yscale('log')
+    for lo, hi in bandas.values():
+        ax.axvline(lo, color='gray', lw=0.6, ls=':')
+    for cf, pw, bw in mod['picos']:
+        ax.axvline(cf, color=_COR['full'], lw=0.6, alpha=0.5)
+    status = 'APROVADO' if info_c['aprovado'] else f"REPROVADO ({info_c['motivo']})"
+    ax.set_title(f"{prefixo} — {cond} — {canal} — FOOOF {FOOOF_FMIN:.0f}–{FOOOF_FMAX:.0f} Hz — {status}",
+                 fontsize=11, fontweight='bold')
+    ax.text(0.02, 0.03, f"R²={mod['r2']:.4f}  erro={mod['erro']:.4f}\nexpoente={mod['expoente']:.3f}  "
+            f"offset={mod['offset']:.3f}\npicos={len(mod['picos'])}  janelas={n_janelas}",
+            transform=ax.transAxes, fontsize=9, va='bottom',
+            bbox=dict(boxstyle='round', facecolor='lightblue', edgecolor='black', alpha=0.9))
+    ax.legend(loc='upper right', fontsize=8)
+    fig.tight_layout()
+    fig.savefig(os.path.join(pasta, f"{prefixo}_{cond}_{_nome_seguro(canal)}_FOOOF.png"), dpi=200)
+    plt.close(fig)
+
+
+def grafico_banda(mod, met, banda, canal, prefixo, cond, pasta):
+    lo, hi = bandas[banda]
+    m = _mascara(mod['freq'], lo, hi)
+    fig, ax = plt.subplots(figsize=(11, 6.5))
+    _desenhar_modelo(ax, mod, m)
+    for cf, pw, bw in mod['picos']:
+        if lo <= cf <= hi:
+            ax.axvline(cf, color=_COR['full'], lw=0.8, alpha=0.6)
+    ax.set_title(f"Banda {banda.upper()} — {canal} — {cond} — {prefixo}", fontsize=12, fontweight='bold')
+    txt = (f"{banda.upper()} ({lo}–{hi} Hz)  |  R²={mod['r2']:.4f}\n\n"
+           f"ORIGINAL   PSD média: {met['psd_orig_media']:.5f} µV²/Hz\n"
+           f"           Área: {met['area_orig']:.5f} µV²   (rel.: {_f(met['rel_orig'], 3)})\n"
+           f"APERIÓDICA PSD média: {met['psd_ap_media']:.5f} µV²/Hz\n"
+           f"           Área: {met['area_ap']:.5f} µV²\n"
+           f"PERIÓDICA  PSD média: {met['psd_per_media']:.5f} µV²/Hz\n"
+           f"           Área: {met['area_per']:.5f} µV²\n"
+           f"           (excesso sobre o aperiódico; ≠ potência total)\n\n")
+    if met['n_picos']:
+        txt += (f"Pico dominante ({met['n_picos']} na banda):\n CF={met['cf']:.2f} Hz  PW={met['pw_log10']:.3f}\n"
+                f" altura={met['altura_linear']:.5f} µV²/Hz  BW={met['bw']:.2f} Hz")
+    else:
+        txt += "Picos: nenhum na banda"
+    ax.text(0.98, 0.98, txt, transform=ax.transAxes, fontsize=8, va='top', ha='right', multialignment='left',
+            family='monospace',
+            bbox=dict(boxstyle='round,pad=0.5', facecolor='white', edgecolor='black', alpha=0.9))
+    ax.legend(loc='center right', bbox_to_anchor=(0.99, 0.35), fontsize=8)
+    fig.tight_layout()
+    fig.savefig(os.path.join(pasta, f"{prefixo}_{cond}_{_nome_seguro(canal)}_{banda}_FOOOF.png"), dpi=200)
+    plt.close(fig)
+
+
+# ============================================================================
+# PIPELINE (independente de MNE: recebe arrays)
+# ============================================================================
+
+def analisar(dados_uv, srate, nomes, bloqueios, saida, prefixo, cond, meta=None, graficos_por_banda=True):
+    meta = dict(meta or {})
+    os.makedirs(saida, exist_ok=True)
+    dados = np.array(dados_uv, dtype=float, copy=True)
+
+    # sanidade de unidade (MNE entrega V; aqui já em µV)
+    med_std = float(np.median(np.std(dados, axis=1)))
+    print(f"  Amplitude típica (desvio-padrão mediano): {med_std:.2f} µV")
+    if not (0.5 < med_std < 500):
+        print("  ⚠ Amplitude fora do típico de EEG em µV — confira a unidade/escala do EDF.")
+
+    juncoes = [(int(round(t * srate)), int(round(t * srate)) + 1) for t in JUNCOES_MANUAIS_S]
+    bloq = list(bloqueios) + juncoes
+    filtro_txt = 'nenhum'
+    if FILTRO_PASSA_ALTA_HZ:
+        dados, extras, n_trechos = filtrar_passa_alta_por_blocos(dados, srate, bloq, FILTRO_PASSA_ALTA_HZ)
+        bloq += extras
+        filtro_txt = f"passa-alta {FILTRO_PASSA_ALTA_HZ:g} Hz em {n_trechos} trecho(s) contínuo(s)"
+        print(f"  Filtro: {filtro_txt} (bordas de {MARGEM_FILTRO_S:g} s e trechos < {MIN_BLOCO_FILTRO_S:g} s descartados)")
+    if REF_MEDIA_COMUM:
+        dados -= dados.mean(axis=0, keepdims=True)
+        print("  Re-referência: média dos canais EEG")
+
+    sel = selecionar_epocas(dados, srate, bloq)
+    n_ep, L = sel['n_ep'], sel['L']
+    print(f"  Épocas de {DURACAO_EPOCA_S:g} s: total={n_ep} | aceitas={sel['n_ok']} | rejeitadas: "
+          f"lacuna/marcador/borda={sel['n_rej_marcador']}, amplitude (> {AMPL_PTP_UV:g} µV)={sel['n_rej_amplitude']}")
+    ordem = np.argsort(-sel['frac_excede_canal'])[:5]
+    pior = [f"{nomes[k]} ({sel['frac_excede_canal'][k] * 100:.0f}%)" for k in ordem if sel['frac_excede_canal'][k] > 0]
+    if pior:
+        print(f"  Canais que mais estouram o limite de amplitude: {', '.join(pior)}")
+
+    janela_s = escolher_janela(sel['n_ok'] * L / srate)
+    nperseg = int(round(janela_s * srate))
+    noverlap = int(round(nperseg * OVERLAP_WELCH))
+    segs = segmentos_contiguos(sel['ok'], L, nperseg)
+    tempo_limpo = sum(b - a for a, b in segs) / srate
+    perdido = sel['n_ok'] * L / srate - tempo_limpo
+    print(f"  Janela de Welch: {janela_s:g} s (resolução {1 / janela_s:.2f} Hz) | segmentos utilizáveis: {len(segs)} | "
+          f"dado limpo: {tempo_limpo:.0f} s" + (f" ({perdido:.0f} s aceitos ficaram isolados, curtos demais p/ 1 janela)" if perdido > 0.5 else ""))
+
+    meta_run = {'tempo_limpo_s': tempo_limpo, 'n_janelas': 0, 'janela_s': janela_s, 'filtro': filtro_txt}
+    caminho_qc = os.path.join(saida, f"{prefixo}_{cond}_QC_canais.txt")
+    if tempo_limpo < MIN_TEMPO_LIMPO_S:
+        escrever_qc(caminho_qc, prefixo, cond, meta, sel, nomes, {}, meta_run)
+        print(f"  ❌ Dado limpo ({tempo_limpo:.0f} s) abaixo do mínimo ({MIN_TEMPO_LIMPO_S:g} s). "
+              f"Análise interrompida. Detalhes: {caminho_qc}")
+        return None
+    if tempo_limpo < TEMPO_RECOMENDADO_S:
+        print(f"  ⚠ Dado limpo ({tempo_limpo:.0f} s) abaixo do recomendado ({TEMPO_RECOMENDADO_S:g} s): "
+              f"resultados menos estáveis; interprete com cautela.")
+
+    info, res_banda, n_jan_ref = OrderedDict(), {}, 0
+    for i, nome in enumerate(nomes):
+        if sel['canais_ruins'][i]:
+            print(f"  {nome}: canal ruim — ignorado")
+            continue
+        norm = normalizar_canal(nome)
+        freqs, psd, n_jan = welch_segmentos(dados[i], srate, nperseg, noverlap, segs)
+        n_jan_ref = max(n_jan_ref, n_jan)
+        mod, erro = (None, "Welch falhou") if freqs is None else ajustar_fooof(freqs, psd)
+        aprovado, motivo = avaliar_canal(mod, erro)
+        info[norm] = {'nome_original': nome, 'aprovado': aprovado, 'motivo': motivo,
+                      'r2': mod['r2'] if mod else None, 'erro': mod['erro'] if mod else None,
+                      'offset': mod['offset'] if mod else None, 'expoente': mod['expoente'] if mod else None,
+                      'picos': mod['picos'] if mod else []}
+        print(f"  {nome}: {'OK' if aprovado else 'REPROVADO'}"
+              + (f"  R²={mod['r2']:.3f} exp={mod['expoente']:.2f} picos={len(mod['picos'])}" if mod else "")
+              + (f"  ({motivo})" if motivo else ""))
+        if mod is None:
+            continue
+        res_banda[norm] = {b: metricas_banda(mod, b) for b in bandas}
+        grafico_canal(mod, nome, info[norm], prefixo, cond, saida, n_jan)
+        if graficos_por_banda:
+            for b in bandas:
+                grafico_banda(mod, res_banda[norm][b], b, nome, prefixo, cond, saida)
+
+    meta_run['n_janelas'] = n_jan_ref
+    regioes = montar_regioes({c: i for c, i in info.items() if c in res_banda}, res_banda)
+
+    pasta_reg = os.path.join(saida, "medias_regionais")
+    os.makedirs(pasta_reg, exist_ok=True)
+    base = f"{prefixo}_{cond}"
+    escrever_relatorio_regional(os.path.join(pasta_reg, f"{base}_MEDIAS_REGIONAIS.txt"), prefixo, cond, regioes, meta_run)
+    escrever_csv_regioes(os.path.join(pasta_reg, f"{base}_medias_regionais.csv"), prefixo, cond, regioes)
+    escrever_csv_canais(os.path.join(saida, f"{base}_metricas_canal_banda.csv"), prefixo, cond, info, res_banda, meta_run)
+    escrever_relatorio_canais(os.path.join(saida, f"{base}_RELATORIO_CANAIS.txt"), prefixo, cond, info, res_banda)
+    escrever_qc(os.path.join(saida, f"{base}_QC_canais.txt"), prefixo, cond, meta, sel, nomes, info, meta_run)
+
+    log = {
+        'timestamp': datetime.now().isoformat(), 'prefixo': prefixo, 'condicao': cond, 'meta_arquivo': meta,
+        'parametros': {
+            'welch': {'janela_s': janela_s, 'janela_modo': 'auto' if not JANELA_WELCH_S else 'fixa', 'overlap': OVERLAP_WELCH, 'nfft': 'nperseg (sem zero-padding)',
+                      'media_entre_janelas': 'aritmetica'},
+            'selecao_dado': {'epoca_s': DURACAO_EPOCA_S, 'ptp_max_uV': AMPL_PTP_UV, 'frac_canal_ruim': FRAC_CANAL_RUIM,
+                             'min_tempo_limpo_s': MIN_TEMPO_LIMPO_S, 'tempo_recomendado_s': TEMPO_RECOMENDADO_S,
+                             'juncoes_manuais_s': JUNCOES_MANUAIS_S},
+            'preproc': {'passa_alta_hz': FILTRO_PASSA_ALTA_HZ, 'filtro_aplicado': filtro_txt,
+                        'margem_filtro_s': MARGEM_FILTRO_S, 'ref_media_comum': REF_MEDIA_COMUM},
+            'fooof': {**fooof_config, 'fit_range': [FOOOF_FMIN, FOOOF_FMAX], 'r2_min_canal': R2_MIN,
+                      'criterio_extra': 'expoente > 0'},
+            'bandas': dict(bandas),
+            'regioes': {'especificas': REGIOES_ESPECIFICAS, 'amplas_regex': REGIOES_AMPLAS},
+        },
+        'resultado_run': {**meta_run, 'epocas_aceitas': sel['n_ok'], 'epocas_total': sel['n_ep'],
+                          'canais_aprovados': [c for c, i in info.items() if i['aprovado']],
+                          'canais_reprovados': {c: i['motivo'] for c, i in info.items() if not i['aprovado']}},
+        'notas': {
+            'coerencia': 'um unico espectro e um unico ajuste por canal; txt/csv/grafico/regional leem o mesmo objeto',
+            'periodico': 'excesso do modelo sobre o aperiodico (linear); nao e potencia total da banda',
+            'area': 'soma discreta x delta_f (bandas particionam a grade de frequencia)',
+            'dp': 'DP entre canais, ddof=1',
+        },
+        'software': {'python': platform.python_version(), 'plataforma': platform.platform(),
+                     'numpy': np.__version__, **_versoes_opcionais()},
+    }
+    with open(os.path.join(saida, f"{base}_log.json"), 'w', encoding='utf-8') as fh:
+        json.dump(log, fh, indent=2, ensure_ascii=False, default=str)
+
+    print(f"  ✔ Concluído. Saída: {saida}")
+    return {'info': info, 'res_banda': res_banda, 'regioes': regioes, 'sel': sel, 'meta_run': meta_run}
+
+
+def _versoes_opcionais():
+    from importlib import metadata
+    out = {}
+    for pkg in ('mne', 'fooof', 'scipy', 'matplotlib'):
+        try:
+            out[pkg] = metadata.version(pkg)
+        except Exception:                                    # noqa: BLE001
+            out[pkg] = None
+    return out
+
+
+def processar_arquivo(caminho, cond=None, pasta_saida=None):
+    prefixo = extrair_prefixo(caminho)
+    cond = (cond or inferir_condicao(caminho)).upper()
+    saida = pasta_saida or os.path.join(os.path.dirname(os.path.abspath(caminho)), f"{prefixo}_{cond}_analise")
+    print(f"\n{'=' * 80}\n{os.path.basename(caminho)} | prefixo {prefixo} | condição {cond}\n{'=' * 80}")
+    d = carregar_edf(caminho)
+    m = d['meta']
+    print(f"  Duração {m['duracao_s']:.1f} s | {len(d['nomes'])} canais EEG | {d['srate']:g} Hz")
+    print(f"  Filtro do arquivo: passa-alta={m['highpass_hz']} Hz, passa-baixa={m['lowpass_hz']} Hz")
+    print(f"  Anotações: {m['anotacoes'] or 'nenhuma'}")
+    if m['canais_ignorados']:
+        print(f"  Ignorados (não-EEG): {', '.join(m['canais_ignorados'])}")
+    if not m['anotacoes'] and not JUNCOES_MANUAIS_S:
+        print("  ⚠ Nenhum marcador no EDF. Se este arquivo foi montado juntando blocos, informe os tempos "
+              "das emendas em JUNCOES_MANUAIS_S.")
+    return analisar(d['dados_uv'], d['srate'], d['nomes'], d['bloqueios'], saida, prefixo, cond, meta=m)
+
+
+# ============================================================================
+# TESTE SINTÉTICO (verifica coerência do pipeline; não substitui inspeção visual)
+# ============================================================================
+
+def _gerar_eeg_sintetico(nomes, fs=250, dur=240, seed=0):
+    rng = np.random.default_rng(seed)
+    n = int(fs * dur)
+    f = np.fft.rfftfreq(n, 1 / fs)
+    out = []
+    for nome in nomes:
+        expo = 1.2 + 0.2 * rng.random()
+        base = np.zeros_like(f)
+        base[1:] = f[1:] ** (-expo / 2)
+        k = 2.0 if nome.upper().startswith(('O', 'P')) else 0.5
+        amp = base * (1 + k * np.exp(-0.5 * ((f - 10.0) / 0.8) ** 2))
+        x = np.fft.irfft(amp * (rng.standard_normal(f.size) + 1j * rng.standard_normal(f.size)), n)
+        out.append(x * (15.0 / x.std()))
+    d = np.array(out)
+    t = np.arange(n) / fs
+    for i, nome in enumerate(nomes):                           # piscadas (frontais) a cada ~15 s
+        if nome.upper().startswith(('FP', 'F')):
+            for tb in np.arange(7, dur - 2, 15.0):
+                d[i] += 300.0 * np.exp(-0.5 * ((t - tb) / 0.12) ** 2)
+    d[:, t >= dur / 2] += 40.0                                # degrau de DC na emenda (t = dur/2)
+    return d, fs
+
+
+def teste_sintetico():
+    nomes = ['Fp1', 'Fp2', 'F7', 'F3', 'Fz', 'F4', 'F8', 'T3', 'C3', 'Cz', 'C4', 'T4', 'T5', 'P3', 'Pz', 'P4',
+             'T6', 'O1', 'O2']
+    assert all(eh_canal_eeg(normalizar_canal(n)) for n in nomes)
+    assert not any(eh_canal_eeg(normalizar_canal(n)) for n in ['ECG', 'EOG', 'Photic', 'Pulse', 'Trigger', 'EDF Annotations'])
+    assert normalizar_canal('EEG Fz-REF') == 'FZ' and normalizar_canal('F3.') == 'F3'
+
+    dados, fs = _gerar_eeg_sintetico(nomes)
+    emenda = int(120 * fs)
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        global JUNCOES_MANUAIS_S
+        JUNCOES_MANUAIS_S = [120.0]
+        r = analisar(dados, fs, nomes, [], tmp, 'SINT', 'TESTE', meta={'duracao_s': 240})
+        assert r is not None
+        # 1) nenhum segmento atravessa a emenda
+        segs = segmentos_contiguos(r['sel']['ok'], r['sel']['L'], int(r['meta_run']['janela_s'] * fs))
+        assert all(not (a < emenda < b) for a, b in segs), "segmento atravessa a emenda"
+        # 2) piscadas foram rejeitadas
+        assert r['sel']['n_rej_amplitude'] > 5
+        # 3) identidades de coerência (para todos os canais/bandas)
+        for c, bandas_c in r['res_banda'].items():
+            for b, m in bandas_c.items():
+                assert np.isclose(m['psd_full_media'], m['psd_ap_media'] + m['psd_per_media'], rtol=1e-9)
+                assert np.isclose(m['area_full'], m['area_ap'] + m['area_per'], rtol=1e-9)
+            assert np.isclose(sum(bandas_c[b]['rel_orig'] for b in bandas), 1.0)
+        # 4) alpha em O1 perto de 10 Hz
+        cf = r['res_banda']['O1']['alpha']['cf']
+        assert cf is not None and abs(cf - 10.0) < 1.0, f"CF alpha O1 = {cf}"
+        print("\n✔ Cenário 1 (240 s, emenda manual, piscadas) OK.")
+
+    # ---- Cenário 2: reproduz um arquivo curto e SEM filtro, com lacuna BAD_ACQ_SKIP ----
+    print("\n--- Cenário 2: 126 s, 512 Hz, sem filtro (offset DC + deriva), lacuna de 4 s zerada ---")
+    JUNCOES_MANUAIS_S = []
+    d2, fs2 = _gerar_eeg_sintetico(nomes, fs=512, dur=126, seed=3)
+    t2 = np.arange(d2.shape[1]) / fs2
+    d2 = d2 + 4000.0 + 90.0 * np.sin(2 * np.pi * 0.15 * t2)      # DC + deriva lenta (sem passa-alta)
+    g0, g1 = int(60 * fs2), int(64 * fs2)
+    d2[:, g0:g1] = 0.0                                             # lacuna preenchida com zeros
+    with tempfile.TemporaryDirectory() as tmp2:
+        r2 = analisar(d2, fs2, nomes, [(g0, g1)], tmp2, 'SINT2', 'OA', meta={'duracao_s': 126})
+        assert r2 is not None, "cenário 2 não deveria abortar"
+        assert r2['meta_run']['janela_s'] == 2.0, "com pouco dado deve usar janela de 2 s"
+        assert r2['meta_run']['tempo_limpo_s'] >= MIN_TEMPO_LIMPO_S
+        assert r2['sel']['n_rej_amplitude'] < 0.5 * r2['sel']['n_ep'], "filtro deveria evitar rejeição em massa por deriva"
+        segs2 = segmentos_contiguos(r2['sel']['ok'], r2['sel']['L'], int(2.0 * fs2))
+        assert all(not (a < g0 < b or a < g1 < b) for a, b in segs2), "segmento cruza a lacuna"
+        cf2 = r2['res_banda']['O1']['alpha']['cf']
+        assert cf2 is not None and abs(cf2 - 10.0) < 1.0, f"CF alpha O1 (cenário 2) = {cf2}"
+    print("\n✔ TESTE SINTÉTICO OK — coerência verificada (2 cenários).")
+
+
+# ============================================================================
+# MAIN
+# ============================================================================
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description="EEG — FOOOF sobre PSD de Welch promediado")
+    ap.add_argument('arquivos', nargs='*', help='arquivos .edf')
+    ap.add_argument('--cond', default=None, help='OA/OF (senão infere do nome do arquivo)')
+    ap.add_argument('--saida', default=None, help='pasta de saída (só faz sentido com 1 arquivo)')
+    ap.add_argument('--teste', action='store_true', help='roda o teste sintético')
+    a = ap.parse_args(argv)
+    if a.teste:
+        teste_sintetico()
+        return
+    for arq in (a.arquivos or [escolher_arquivo_eeg()]):
+        processar_arquivo(arq, a.cond, a.saida)
+
+
+if __name__ == "__main__":
+    main()
