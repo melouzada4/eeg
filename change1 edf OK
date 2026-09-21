@@ -796,7 +796,7 @@ def calcular_e_salvar_medias_regionais(banco_regional, prefixo, pasta_analise):
                 bandas_ordenadas.append(b)
         return bandas_ordenadas
 
-      def bloco_regiao(nome_regiao, entradas_por_banda_cond, tipo_label):
+    def bloco_regiao(nome_regiao, entradas_por_banda_cond, tipo_label):
         linhas = [f"\n  {'─'*60}",
                   f"  {tipo_label}: {nome_regiao}",
                   f"  {'─'*60}"]
@@ -1197,7 +1197,7 @@ if __name__ == "__main__":
     print("=" * 80)
 
     print("\nSelecione o arquivo EEG (.edf):")
-    arquivo_set = escolher_arquivo_set()
+    arquivo_set = escolher_arquivo_eeg()
 
     prefixo_saida = extrair_prefixo(os.path.basename(arquivo_set))
     saida = os.path.join(os.path.dirname(arquivo_set), f"{prefixo_saida}_analise")
