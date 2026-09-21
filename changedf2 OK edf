@@ -48,7 +48,7 @@ REGIOES_ESPECIFICAS = {
     'O_especifico':  ['O1', 'O2', 'OZ', 'Oz'],
 }
 
-# MODIFICAÇÃO 2: Ordem das bandas para exibição no relatório regional
+# Ordem das bandas para exibição no relatório regional
 ORDEM_BANDAS_RELATORIO = ['beta', 'alpha', 'theta', 'delta']
 
 
